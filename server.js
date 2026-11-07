@@ -1,75 +1,929 @@
-// FAST PRINT PORTAL - sab kuch ek file me (website + shared database server)
-// Run:  node server.js     then open  http://localhost:3000
+// FAST PRINT PORTAL v2 - secure backend (zero npm dependencies)
+// Run:  node server.js      then open  http://localhost:3000
+//
+// What changed vs v1:
+//  * Database lives ONLY on the server. The browser never receives password hashes,
+//    Telegram tokens or other users' wallets any more (v1 sent the whole DB to every visitor).
+//  * Login uses server sessions (HttpOnly cookie). Existing SHA-256("pp:"+password) hashes keep working.
+//  * Every wallet movement is written to a ledger. Orders / refunds / UTR approvals are atomic.
+//  * Telegram + WhatsApp admin notifications are fire-and-forget and can never break a customer request.
+//  * data.json keeps the same { rev, data } format - all old keys are preserved, new keys are only added.
+'use strict';
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
-const PORT = process.env.PORT || 3000;
-const DATA_DIR = process.env.DATA_DIR || __dirname;      // hosting par persistent disk ka folder yahan dein
+const PORT = Number(process.env.PORT) || 3000;
+const DATA_DIR = process.env.DATA_DIR || __dirname;          // on hosting: point to the persistent disk folder
 const FILE = path.join(DATA_DIR, 'data.json');
-const MAX_BODY = 100 * 1024 * 1024;                        // 100 MB (uploaded files data me store hoti hain)
+const SESSION_FILE = path.join(DATA_DIR, 'sessions.json');
+const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const TRUST_PROXY = process.env.TRUST_PROXY === '1';           // set to 1 when behind nginx / Render / Railway etc.
+const SESSION_TTL = 7 * 24 * 3600 * 1000;
+const LIMIT_JSON = 1 * 1024 * 1024;
+const LIMIT_UPLOAD = 30 * 1024 * 1024;
+const LIMIT_RESTORE = 100 * 1024 * 1024;
+const MAX_FILE_BYTES = 8 * 1024 * 1024;
+
+/* ============================== HELPERS ============================== */
+class HttpError extends Error { constructor(code, msg) { super(msg); this.code = code; } }
+const bad = (msg, code = 400) => { throw new HttpError(code, msg); };
+const IST = { timeZone: 'Asia/Kolkata' };
+const now = () => new Date().toLocaleString('en-IN', IST);
+const today = () => new Date().toLocaleDateString('en-IN', IST);
+const sha256 = s => crypto.createHash('sha256').update(s).digest('hex');
+const hashPw = p => sha256('pp:' + p);                          // identical to the v1 browser hash -> old logins still work
+const r2 = n => Math.round((Number(n) || 0) * 100) / 100;
+const str = (v, max = 200) => String(v == null ? '' : v).trim().slice(0, max);
+const clone = x => JSON.parse(JSON.stringify(x));
+const safeEq = (a, b) => {
+  const x = Buffer.from(String(a)), y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+};
+const escHtml = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const rupee = n => '\u20B9' + r2(n).toFixed(2);
+
+/* ============================== DATABASE ============================== */
+const DEFAULT_SETTINGS = {
+  title: 'PDF PRINT PORTAL',
+  sub: 'India ka sabse tez Print Portal \u2014 Fast, safe aur sasti document delivery.',
+  notice: 'Password bhul gaye hain? Forgot Password par click karein. Naye updates aur link ke liye Telegram se zaroor judein.',
+  upi: 'merchant@upi', qr: '', tgBotToken: '', tgChatId: '', waLink: '',
+  // --- new in v2 ---
+  waWebhook: '', waApiKey: '',
+  notifyOrder: true, notifyDeposit: true, notifyComplaint: true,
+  tickerOn: false, tickerText: '', tickerSpeed: 40,
+  popupOn: false, popupTitle: '', popupMsg: '', popupBtnText: '', popupBtnLink: '', popupDismiss: 'session', popupVer: 1,
+  customCss: '', customHtml: '', customJs: ''
+};
+const SEQ_DEFAULT = { CUS: 1, STF: 1, SRV: 1, ORD: 1, PAY: 1, TKT: 1, LED: 1 };
+const CHIPS = ['aadhaar', 'voter', 'pan', 'vehicle', 'farmer', 'ration', 'exam', 'lookup', 'manual'];
+const PLACEMENTS = ['quick', 'accordion', 'grid'];
+const BADGES = ['', 'FAST', 'NEW', 'PRO', 'LIVE'];
+const FIELD_TYPES = ['text', 'password', 'date', 'dropdown', 'file', 'number', 'textarea'];
 
 let state = null, rev = 0, lastBackup = 0;
+
+function inferChip(n) {
+  n = String(n || '').toLowerCase();
+  if (/aadhaar|aadhar/.test(n)) return 'aadhaar';
+  if (/voter|epic/.test(n)) return 'voter';
+  if (/\bpan\b/.test(n)) return 'pan';
+  if (/\brc\b|\bdl\b|vehicle|driving|puc/.test(n)) return 'vehicle';
+  if (/farmer|kisan|dbt|scheme/.test(n)) return 'farmer';
+  if (/ration/.test(n)) return 'ration';
+  if (/learning|exam|birth|certificate|cert/.test(n)) return 'exam';
+  if (/lookup|search|status/.test(n)) return 'lookup';
+  return 'manual';
+}
+function inferLayout(n) {
+  n = String(n || '').toLowerCase();
+  if (/learning|voter pdf|voter mobile|puc|birth/.test(n)) return { placement: 'quick', group: '' };
+  if (/\brc pdf/.test(n)) return { placement: 'accordion', group: 'RC PDF' };
+  if (/\bdl pdf/.test(n)) return { placement: 'accordion', group: 'DL PDF' };
+  if (/aadhaar|aadhar/.test(n)) return { placement: 'accordion', group: 'Aadhaar PDF' };
+  if (/farmer|dbt/.test(n)) return { placement: 'accordion', group: 'Farmer DBT' };
+  return { placement: 'grid', group: '' };
+}
+
+// Adds missing keys only. Never removes or rewrites existing customer / wallet / order data.
+function normalize(d) {
+  d.users = Array.isArray(d.users) ? d.users : [];
+  d.services = Array.isArray(d.services) ? d.services : [];
+  d.orders = Array.isArray(d.orders) ? d.orders : [];
+  d.pays = Array.isArray(d.pays) ? d.pays : [];
+  d.complaints = Array.isArray(d.complaints) ? d.complaints : [];
+  d.ledger = Array.isArray(d.ledger) ? d.ledger : [];
+  d.settings = Object.assign({}, DEFAULT_SETTINGS, d.settings || {});
+  d.seq = Object.assign({}, SEQ_DEFAULT, d.seq || {});
+  d.users.forEach(u => { delete u.plainPw; if (typeof u.wallet !== 'number') u.wallet = r2(u.wallet); });
+  if (!d.users.some(u => u.role === 'admin' && u.u === 'admin')) {
+    d.users.unshift({ id: 'ADM0001', u: 'admin', name: 'Super Admin', role: 'admin', hash: hashPw('Admin@12345'), wallet: 0, services: ['ALL'], loginCount: 0, lastLogin: now() });
+  }
+  d.services.forEach((s, i) => {
+    const lay = inferLayout(s.name);
+    if (!PLACEMENTS.includes(s.placement)) s.placement = lay.placement;
+    if (typeof s.group !== 'string') s.group = lay.group;
+    if (!CHIPS.includes(s.chip)) s.chip = inferChip(s.name);
+    if (typeof s.serverLabel !== 'string') s.serverLabel = s.group ? 'Server 1' : '';
+    if (!BADGES.includes(s.badge)) s.badge = '';
+    if (typeof s.iconUrl !== 'string') s.iconUrl = '';
+    if (typeof s.sort !== 'number') s.sort = (i + 1) * 10;
+    if (!Array.isArray(s.endpoints)) s.endpoints = [];
+    if (!Array.isArray(s.fields)) s.fields = [];
+    if (!Array.isArray(s.instructions)) s.instructions = [];
+  });
+  // v1 bug fix: its counters could be lower than ids already in use (e.g. SRV counter 1 while SRV0007 exists)
+  const bump = (prefix, list) => list.forEach(x => {
+    const m = String(x && x.id || '').match(/^([A-Z]+)(\d+)$/);
+    if (m && m[1] === prefix) d.seq[prefix] = Math.max(d.seq[prefix], Number(m[2]) + 1);
+  });
+  bump('CUS', d.users); bump('STF', d.users); bump('SRV', d.services); bump('ORD', d.orders);
+  bump('PAY', d.pays); bump('TKT', d.complaints); bump('LED', d.ledger);
+  return d;
+}
+
 try {
   const j = JSON.parse(fs.readFileSync(FILE, 'utf8'));
-  state = j.data; rev = j.rev || 0;
-  console.log('Data load hua: rev', rev, '| users:', (state.users || []).length);
-} catch (e) { console.log('Nayi database shuru ho rahi hai'); }
+  state = normalize(j.data || j); rev = j.rev || 0;
+  console.log('Data loaded: rev', rev, '| users:', state.users.length, '| orders:', state.orders.length);
+} catch (e) {
+  if (fs.existsSync(FILE)) { console.error('data.json is unreadable - refusing to start so nothing gets overwritten.\n', e.message); process.exit(1); }
+  state = normalize({}); console.log('Fresh database created (admin / Admin@12345 - change it after login!)');
+}
 
 function persist() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const tmp = FILE + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify({ rev, data: state }));
-  if (fs.existsSync(FILE) && Date.now() - lastBackup > 60000) {      // har minute me max 1 backup copy
-    try { fs.copyFileSync(FILE, FILE + '.bak'); lastBackup = Date.now(); } catch (e) {}
+  if (fs.existsSync(FILE) && Date.now() - lastBackup > 60000) {      // max 1 rolling backup per minute
+    try { fs.copyFileSync(FILE, FILE + '.bak'); lastBackup = Date.now(); } catch (e) { /* ignore */ }
   }
-  fs.renameSync(tmp, FILE);                                           // atomic write: file adhoori nahi hogi
+  fs.renameSync(tmp, FILE);                                           // atomic write
+}
+function commit() {
+  rev++;
+  try { persist(); } catch (e) { console.error('SAVE ERROR', e); throw new HttpError(500, 'Server disk write failed'); }
+}
+// one-time safety copy of your original v1 file before it gets upgraded in place
+try { const pre = path.join(DATA_DIR, 'data.pre-v2.json'); if (fs.existsSync(FILE) && !fs.existsSync(pre)) fs.copyFileSync(FILE, pre); } catch (e) { /* ignore */ }
+persistSafe();
+function persistSafe() { try { persist(); } catch (e) { console.error('Initial save failed', e.message); } }
+
+function nextId(prefix, pad = 4) {
+  const n = state.seq[prefix] || 1;
+  state.seq[prefix] = n + 1;
+  return prefix + String(n).padStart(pad, '0');
+}
+const findUser = id => state.users.find(u => u.id === id);
+
+function walletMove(user, amt, type, note, by, ref) {
+  amt = r2(amt);
+  user.wallet = r2((user.wallet || 0) + amt);
+  const e = { id: nextId('LED', 6), uid: user.id, uname: user.u, type, amt, bal: user.wallet, note: str(note, 200), by: by || 'system', ref: ref || '', t: now() };
+  state.ledger.unshift(e);
+  return e;
 }
 
-// Website ki teeno files isi file ke andar hain (alag se rakhne ki zaroorat nahi)
-const PAGES = {
-  '/': ['text/html; charset=utf-8', "<!DOCTYPE html>\n<html lang=\"hi\">\n<head>\n<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>FAST PRINT PORTAL - Multi-Service Hub</title>\n<link rel=\"stylesheet\" href=\"style.css\">\n</head>\n<body>\n<div id=\"root\"></div>\n<div id=\"toast\"></div>\n<div id=\"appModal\"></div>\n<script src=\"script.js\"></script>\n</body>\n</html>"],
-  '/index.html': ['text/html; charset=utf-8', null],
-  '/script.js': ['application/javascript; charset=utf-8', "const $ = s => document.querySelector(s);\nconst esc = s => String(s ?? '').replace(/[&<>\"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]));\n\n// Persistent Database State\nlet D;\ntry { D = JSON.parse(localStorage.getItem('pp_core')); } catch (e) {}\nD = D || {\n  users: [],\n  services: [],\n  orders: [],\n  pays: [],\n  seq: { CUS: 1, STF: 1, SRV: 1, ORD: 1, PAY: 1 }\n};\n\nD.settings = Object.assign({\n  title: 'PDF PRINT PORTAL',\n  sub: 'India ka sabse tez Print Portal — Fast, safe aur sasti document delivery.',\n  notice: 'Password bhul gaye hain? Forgot Password par click karein. Naye updates aur link ke liye Telegram se zaroor judein.',\n  upi: 'merchant@upi',\n  qr: '',\n  tgBotToken: '',\n  tgChatId: '',\n  waLink: ''\n}, D.settings || {});\nD.complaints = D.complaints || [];\nD.users.forEach(u => { delete u.plainPw; });\n\nD.seq = Object.assign({ CUS: 1, STF: 1, SRV: 1, ORD: 1, PAY: 1 }, D.seq || {});\n\nconst nextId = (prefix, pad = 4) => {\n  const num = D.seq[prefix] || 1;\n  D.seq[prefix] = num + 1;\n  save();\n  return prefix + String(num).padStart(pad, '0');\n};\n\nconst save = () => {\n  try { localStorage.setItem('pp_core', JSON.stringify(D)); } catch (e) { /* local cache full - server copy hi asli hai */ }\n  pushRemote();\n};\n\n/* ==================== SERVER SYNC (shared database) ==================== */\nlet remoteReady = false, remoteRev = 0, snap = null, pushTimer = null, pushing = false, pushAgain = false, dirty = false, netWarned = false;\nconst clone = x => JSON.parse(JSON.stringify(x));\n\nfunction applyDefaults() {\n  D.users = D.users || [];\n  D.services = D.services || [];\n  D.orders = D.orders || [];\n  D.pays = D.pays || [];\n  D.complaints = D.complaints || [];\n  D.settings = Object.assign({\n    title: 'PDF PRINT PORTAL',\n    sub: 'India ka sabse tez Print Portal — Fast, safe aur sasti document delivery.',\n    notice: 'Password bhul gaye hain? Forgot Password par click karein. Naye updates aur link ke liye Telegram se zaroor judein.',\n    upi: 'merchant@upi', qr: '', tgBotToken: '', tgChatId: '', waLink: ''\n  }, D.settings || {});\n  D.seq = Object.assign({ CUS: 1, STF: 1, SRV: 1, ORD: 1, PAY: 1 }, D.seq || {});\n}\n\n// D replace hone ke baad login user / selected service ko naye D se jodna\nfunction relink() {\n  if (me) me = D.users.find(x => x.id === me.id) || null;\n  if (typeof selectedService !== 'undefined' && selectedService) selectedService = D.services.find(x => x.id === selectedService.id) || null;\n}\n\n// 3-way merge: base = last synced, mine = local changes, theirs = server latest\nfunction merge3(base, mine, theirs) {\n  const out = clone(theirs);\n  const byId = a => new Map((a || []).map(x => [x.id, x]));\n  const front = { orders: 1, pays: 1, complaints: 1 };\n  for (const k of ['users', 'services', 'orders', 'pays', 'complaints']) {\n    const b = byId(base[k]), m = byId(mine[k]), t = byId(theirs[k]);\n    const res = [];\n    for (const it of (theirs[k] || [])) {\n      const id = it.id;\n      if (b.has(id) && !m.has(id)) continue;                               // local me delete hua tha\n      if (m.has(id) && JSON.stringify(m.get(id)) !== JSON.stringify(b.get(id))) res.push(clone(m.get(id)));   // local me badla tha\n      else res.push(clone(it));\n    }\n    const added = (mine[k] || []).filter(x => !t.has(x.id) && !b.has(x.id)).map(clone);   // local me naya bana\n    out[k] = front[k] ? added.concat(res) : res.concat(added);\n  }\n  out.seq = Object.assign({}, theirs.seq);\n  for (const p of Object.keys(mine.seq || {})) out.seq[p] = Math.max(out.seq[p] || 1, mine.seq[p] || 1);\n  out.settings = JSON.stringify(mine.settings) !== JSON.stringify(base.settings) ? clone(mine.settings) : clone(theirs.settings);\n  return out;\n}\n\nfunction pushRemote() {\n  if (!remoteReady) return;\n  dirty = true;\n  clearTimeout(pushTimer);\n  pushTimer = setTimeout(pushNow, 400);\n}\n\nasync function pushNow() {\n  if (!remoteReady) return;\n  if (pushing) { pushAgain = true; return; }\n  pushing = true;\n  try {\n    const res = await fetch('/api/state', {\n      method: 'PUT', headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({ baseRev: remoteRev, data: D })\n    });\n    const j = await res.json();\n    if (res.status === 409) {\n      D = merge3(snap || j.data, D, j.data);\n      applyDefaults();\n      remoteRev = j.rev; snap = clone(j.data);\n      relink();\n      try { localStorage.setItem('pp_core', JSON.stringify(D)); } catch (e) {}\n      pushAgain = true;\n    } else if (res.ok) {\n      remoteRev = j.rev; snap = clone(D); dirty = false; netWarned = false;\n    } else throw new Error('save failed');\n  } catch (e) {\n    if (!netWarned) { netWarned = true; toast('Server se connection nahi ho paya — data abhi save nahi hua, dobara try ho raha hai'); }\n  }\n  pushing = false;\n  if (pushAgain) { pushAgain = false; pushNow(); }\n}\n\n// Login / register se pehle sabse latest data server se lena\nasync function pullLatest() {\n  if (!remoteReady || dirty || pushing) return;\n  try {\n    const r = await (await fetch('/api/rev', { cache: 'no-store' })).json();\n    if (r.rev === remoteRev) return;\n    const s = await (await fetch('/api/state', { cache: 'no-store' })).json();\n    if (s.data) { D = s.data; remoteRev = s.rev; snap = clone(D); applyDefaults(); relink(); }\n  } catch (e) {}\n}\n\nasync function bootRemote() {\n  try {\n    const r = await fetch('/api/state', { cache: 'no-store' });\n    if (!r.ok) throw new Error('no server');\n    const j = await r.json();\n    remoteRev = j.rev || 0;\n    if (j.data && Array.isArray(j.data.users)) {\n      D = j.data; snap = clone(D); applyDefaults();\n      remoteReady = true;\n    } else {\n      remoteReady = true;            // server khali hai: is browser ka maujooda data pehli baar upload hoga\n      await syncAdmin();\n      await pushNow();\n    }\n    await syncAdmin();\n  } catch (e) {\n    toast('Server se connect nahi hua — sirf is browser me data chal raha hai. server.js chalu karein.');\n  }\n  render();\n  restoreSession();\n  startPolling();\n}\n\nfunction startPolling() {\n  setInterval(async () => {\n    if (!remoteReady || document.hidden || pushing) return;\n    if (dirty) { pushNow(); return; }\n    try {\n      const r = await (await fetch('/api/rev', { cache: 'no-store' })).json();\n      if (r.rev === remoteRev) return;\n      const ae = document.activeElement;\n      if (ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName)) return;      // typing ke beech page refresh nahi hoga\n      if ($('#appModal').innerHTML.trim()) return;\n      const s = await (await fetch('/api/state', { cache: 'no-store' })).json();\n      if (!s.data) return;\n      D = s.data; remoteRev = s.rev; snap = clone(D); applyDefaults(); relink();\n      render();\n    } catch (e) {}\n  }, 5000);\n}\n\n// Cryptographic SHA-256 Utility\nfunction sha256(str) {\n  const b = new TextEncoder().encode(str), l = b.length, pr = [];\n  for (let n = 2; pr.length < 64; n++) if (pr.every(p => n % p)) pr.push(n);\n  const fr = x => Math.floor((x - Math.floor(x)) * 4294967296), K = pr.map(p => fr(Math.cbrt(p)));\n  let H = pr.slice(0, 8).map(p => fr(Math.sqrt(p)));\n  const n = ((l + 9 + 63) >> 6) << 6, m = new Uint8Array(n);\n  m.set(b); m[l] = 128;\n  const D2 = new DataView(m.buffer);\n  D2.setUint32(n - 4, (l * 8) >>> 0);\n  D2.setUint32(n - 8, Math.floor(l * 8 / 4294967296));\n  const R = (x, k) => (x >>> k) | (x << (32 - k));\n  for (let i = 0; i < n; i += 64) {\n    const W = new Uint32Array(64);\n    for (let t = 0; t < 16; t++) W[t] = D2.getUint32(i + t * 4);\n    for (let t = 16; t < 64; t++) {\n      const a = W[t - 15], c = W[t - 2];\n      W[t] = (W[t - 16] + (R(a, 7) ^ R(a, 18) ^ (a >>> 3)) + W[t - 7] + (R(c, 17) ^ R(c, 19) ^ (c >>> 10))) >>> 0;\n    }\n    let [a, b2, c, d, e, f, g, h] = H;\n    for (let t = 0; t < 64; t++) {\n      const t1 = (h + (R(e, 6) ^ R(e, 11) ^ R(e, 25)) + ((e & f) ^ (~e & g)) + K[t] + W[t]) >>> 0;\n      const t2 = ((R(a, 2) ^ R(a, 13) ^ R(a, 22)) + ((a & b2) ^ (a & c) ^ (b2 & c))) >>> 0;\n      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b2; b2 = a; a = (t1 + t2) >>> 0;\n    }\n    H = H.map((x, j) => (x + [a, b2, c, d, e, f, g, h][j]) >>> 0);\n  }\n  return H.map(x => x.toString(16).padStart(8, '0')).join('');\n}\n\nconst hash = async p => {\n  const t = 'pp:' + p;\n  try {\n    if (window.crypto && crypto.subtle) {\n      return [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(t)))]\n        .map(b => b.toString(16).padStart(2, '0')).join('');\n    }\n  } catch (e) {}\n  return sha256(t);\n};\n\n// Permanent Super Admin Synchronization (admin / Admin@12345)\nasync function syncAdmin() {\n  if (!D.users.find(u => u.role === 'admin' && u.u === 'admin')) {\n    D.users.unshift({ id: 'ADM0001', u: 'admin', name: 'Super Admin', role: 'admin', hash: await hash('Admin@12345'), wallet: 0, services: ['ALL'], loginCount: 0, lastLogin: now() });\n  }\n  save();\n}\nsyncAdmin();\n\n// Initial Default Services Matching Image 10 & 11\nif (!D.services.length) {\n  D.services = [\n    {\n      id: 'SRV0001',\n      name: 'Learning License Request',\n      price: 80,\n      icon: '🚗',\n      cat: 'PRINT',\n      on: true,\n      fields: [\n        { label: 'Application Number', type: 'text', placeholder: 'App****6545', hint: 'Enter your LL Application Number', req: true },\n        { label: 'Password', type: 'password', placeholder: 'Enter Password', hint: 'SMS me mila password darj karein', req: true },\n        { label: 'Date Of Birth', type: 'date', placeholder: '01/01/2000', hint: 'Format: DD/MM/YYYY', req: true },\n        { label: 'Exam Pin (Optional)', type: 'text', placeholder: 'Enter Exam Pin', hint: 'Only for Non-Aadhaar Mode', req: false },\n        { label: 'Select State', type: 'dropdown', opts: '-- Select Your State --,Bihar,Jharkhand,Uttar Pradesh,Delhi,West Bengal', hint: 'Apna State chunein', req: true }\n      ],\n      instructions: [\n        'Video dekhna anivarya hai: Data lagane se pehle test instructions dhyan se padhein.',\n        'Password: SMS dwara prapt sahi password hi darj karein.',\n        'Duplicate Data Warning: Ek hi application number bar-bar lagane par penalty lag sakti hai.',\n        'Approval Time: Data process hone ka samay 15 se 30 minute hai.'\n      ]\n    },\n    { id: 'SRV0002', name: 'Voter PDF Instant', price: 20, icon: '🗳️', cat: 'PRINT', on: true, fields: [{ label: 'EPIC Number', type: 'text', req: true }, { label: 'State', type: 'dropdown', opts: 'Bihar,Jharkhand,UP,Delhi,Other', req: true }] },\n    { id: 'SRV0003', name: 'RC PDF Download', price: 25, icon: '🏍️', cat: 'PRINT', on: true, fields: [{ label: 'Vehicle Number', type: 'text', req: true }] },\n    { id: 'SRV0004', name: 'DL PDF Card', price: 30, icon: '🪪', cat: 'PRINT', on: true, fields: [{ label: 'DL Number', type: 'text', req: true }, { label: 'DOB', type: 'date', req: true }] },\n    { id: 'SRV0005', name: 'Birth Certificate', price: 50, icon: '📜', cat: 'CERT', on: true, fields: [{ label: 'Application No / Reg ID', type: 'text', req: true }, { label: 'State', type: 'text', req: true }] },\n    { id: 'SRV0006', name: 'Ration PDF', price: 15, icon: '🌾', cat: 'PRINT', on: true, fields: [{ label: 'Ration Card Number', type: 'text', req: true }] },\n    { id: 'SRV0007', name: 'Pan Card Instant', price: 25, icon: '💳', cat: 'PRINT', on: true, fields: [{ label: 'PAN Number', type: 'text', req: true }, { label: 'Full Name', type: 'text', req: true }] }\n  ];\n}\n\nconst now = () => new Date().toLocaleString('en-IN');\nconst rupee = n => '₹' + Number(n || 0).toFixed(2);\nconst toast = m => {\n  const t = $('#toast');\n  t.textContent = m;\n  t.style.display = 'block';\n  setTimeout(() => t.style.display = 'none', 3000);\n};\n\nlet me = null, view = 'dash', activeTab = 'in', searchKw = '';\nlet secretModal = false, secretRole = 'admin';\nlet showSuccessModal = false;\n\nlet cap = {};\nconst newCap = () => { cap = { a: 1 + Math.floor(Math.random() * 9), b: 1 + Math.floor(Math.random() * 9) }; };\nnewCap();\n\n// Keyboard Shortcut: Ctrl + Shift + A\nwindow.addEventListener('keydown', e => {\n  if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'a') {\n    secretModal = true;\n    render();\n  }\n});\n\n/* ==================== 1. FRONT AUTH VIEW ==================== */\nfunction authView() {\n  const S = D.settings;\n  return `\n  <div class=\"portal-header\">\n    <div class=\"portal-brand\">\n      <b>${esc(S.title)}</b><br><small>All Documents & Print Services Hub</small>\n    </div>\n    <button class=\"btn s\" style=\"background:#334155\" onclick=\"toast('Home Screen')\">⌂ Public Portal</button>\n  </div>\n\n  <div class=\"login-stage\">\n    <div class=\"stage-left\">\n      <div>\n        <div class=\"hero-tag\">INDIA - PNO 1 PRINT PORTAL</div>\n        <h3 style=\"color:#cbd5e1;font-size:16px;margin-bottom:6px\">Welcome back to</h3>\n        <h1>${esc(S.title)}</h1>\n        <p>${esc(S.sub)}</p>\n\n        <div class=\"pill-list\">\n          <div class=\"feature-pill\">⚡ Instant Download & Order Tracking</div>\n          <div class=\"feature-pill\">₹ Wholesale & Lowest Price Guarantee</div>\n          <div class=\"feature-pill\">🛡️ 100% Encrypted Customer Data & Wallet</div>\n          <div class=\"feature-pill\">↩ Rejected Order par Instant Auto Refund</div>\n        </div>\n\n        <div class=\"trust-scene\" style=\"margin-top:18px\">\n          <div class=\"cube-wrap\"><div class=\"cube\">\n            <div class=\"face f1\">🔒<small>Secure</small></div><div class=\"face f2\">⚡<small>Fast</small></div>\n            <div class=\"face f3\">✔<small>Tracked</small></div><div class=\"face f4\">↩<small>Refund</small></div>\n            <div class=\"face f5\">🛡️</div><div class=\"face f6\">₹</div>\n          </div><div class=\"cube-shadow\"></div></div>\n          <div class=\"trust-text\"><b>Aapka paisa aur data surakshit</b><span>Har order ka live status dikhta hai, aur reject hone par paisa wallet me wapas aa jata hai.</span></div>\n        </div>\n      </div>\n\n      <div class=\"stats-bar\">\n        <div><b>${D.users.filter(u => u.role === 'customer').length}</b><small>Members</small></div>\n        <div><b>${D.orders.length}</b><small>Orders</small></div>\n        <div><b>24x7</b><small>Live Support</small></div>\n      </div>\n    </div>\n\n    <div class=\"stage-right\">\n      <div style=\"font-size:20px;font-weight:800;color:#0f172a;margin-bottom:2px\">👤 Member Login</div>\n      <p style=\"color:var(--mut);font-size:12px;margin-bottom:12px\">Apne Customer Account me Login Karein</p>\n\n      <div class=\"alert-yellow\">\n        <b>📢 ज़रूरी सूचना — ज़रूर पढ़ें:</b><br>${esc(S.notice)}\n      </div>\n\n      <div class=\"sub-tabs\">\n        <button class=\"${activeTab === 'in' ? 'on' : ''}\" onclick=\"activeTab='in';render()\">➔ Login</button>\n        <button class=\"${activeTab === 'up' ? 'on' : ''}\" onclick=\"activeTab='up';render()\">👤+ Naya Account (FREE)</button>\n      </div>\n\n      ${activeTab === 'in' ? `\n        <label>Mobile / Username</label>\n        <input id=\"u_name\" placeholder=\"Mobile Number ya Username daalein\">\n        <div class=\"chip-row\">\n          <span class=\"hint-chip\">📱 9876543210</span>\n          <span class=\"hint-chip\">👤 username</span>\n        </div>\n\n        <label>Password</label>\n        <input id=\"u_pass\" type=\"password\" placeholder=\"Password darj karein\" onkeydown=\"if(event.key=='Enter')custLogin()\">\n\n        <div class=\"captcha-container\">\n          <span>${cap.a} + ${cap.b} = ?</span>\n          <input id=\"u_cap\" inputmode=\"numeric\" placeholder=\"Answer\">\n          <button onclick=\"newCap();render()\">↻</button>\n        </div>\n\n        <button class=\"btn\" style=\"width:100%;padding:11px\" onclick=\"custLogin()\">🔒 Captcha Verify & Login</button>\n      ` : `\n        <label>Full Name</label><input id=\"reg_n\" placeholder=\"Apna Poora Naam\">\n        <label>Mobile Number (10 Digit)</label><input id=\"reg_m\" inputmode=\"numeric\" placeholder=\"Mobile Number\">\n        <label>Username</label><input id=\"reg_u\" placeholder=\"Unique username\">\n        <label>Password (min 8 akshar)</label><input id=\"reg_p\" type=\"password\" placeholder=\"Password\">\n        \n        <div class=\"captcha-container\">\n          <span>${cap.a} + ${cap.b} = ?</span>\n          <input id=\"u_cap\" inputmode=\"numeric\" placeholder=\"Answer\">\n          <button onclick=\"newCap();render()\">↻</button>\n        </div>\n\n        <button class=\"btn g\" style=\"width:100%;padding:11px\" onclick=\"custReg()\">Naya Account Banayein</button>\n      `}\n\n      <div class=\"secret-link\">\n        <a onclick=\"secretModal=true;render()\">⚡ System Gateway</a>\n      </div>\n    </div>\n  </div>\n\n  ${secretDeskView()}\n  `;\n}\n\nfunction secretDeskView() {\n  if (!secretModal) return '';\n  return `\n  <div class=\"dark-overlay\" onclick=\"if(event.target===this){secretModal=false;render()}\">\n    <div class=\"dark-box\">\n      <div class=\"dark-check\">✔</div>\n      <h2>DataWork Pro</h2>\n      <div class=\"sub\">Master Staff & Admin Terminal</div>\n\n      <div class=\"dark-tabs\">\n        <button class=\"${secretRole === 'operator' ? 'on' : ''}\" onclick=\"secretRole='operator';render()\">\n          👤 Operator / Staff\n        </button>\n        <button class=\"${secretRole === 'admin' ? 'on' : ''}\" onclick=\"secretRole='admin';render()\">\n          👑 Super Admin\n        </button>\n      </div>\n\n      <label>USERNAME</label>\n      <input id=\"sec_u\" autocomplete=\"off\" value=\"${secretRole === 'admin' ? 'admin' : ''}\" placeholder=\"${secretRole === 'admin' ? 'admin' : 'staff user'}\">\n\n      <label>PASSWORD</label>\n      <input id=\"sec_p\" type=\"password\" placeholder=\"Password daalein\" onkeydown=\"if(event.key=='Enter')secretLogin()\">\n\n      <button class=\"btn\" style=\"width:100%;background:#6366f1;padding:12px;border-radius:10px\" onclick=\"secretLogin()\">\n        ➔ Login Master Desk\n      </button>\n\n      <div style=\"text-align:center;margin-top:14px\">\n        <a onclick=\"secretModal=false;render()\" style=\"color:#64748b;font-size:11px;cursor:pointer\">✕ Close Desk</a>\n      </div>\n    </div>\n  </div>`;\n}\n\nasync function custLogin() {\n  if (+$('#u_cap').value !== cap.a + cap.b) {\n    newCap();\n    render();\n    return toast('Captcha galat hai');\n  }\n  await pullLatest();\n  const u = $('#u_name').value.trim(), p = $('#u_pass').value;\n  const h = await hash(p);\n  const user = D.users.find(x => x.role === 'customer' && (x.u === u || (x.mobile && x.mobile === u)) && x.hash === h);\n\n  if (!user) return toast('Galat username ya password');\n  if (user.locked) return toast('Account locked hai');\n\n  user.loginCount = (user.loginCount || 0) + 1;\n  user.lastLogin = now();\n  save();\n\n  me = user;\n  view = 'dash';\n  render();\n}\n\nasync function custReg() {\n  if (+$('#u_cap').value !== cap.a + cap.b) {\n    newCap();\n    render();\n    return toast('Captcha galat hai');\n  }\n  await pullLatest();\n  const n = $('#reg_n').value.trim(), m = $('#reg_m').value.trim(), u = $('#reg_u').value.trim(), p = $('#reg_p').value;\n  if (!n || !m || !u || p.length < 8) return toast('Sabhi field bharein (password min 8)');\n  if (D.users.some(x => x.u === u || x.mobile === m)) return toast('Mobile ya Username pehle se registered hai');\n\n  const newCust = {\n    id: nextId('CUS', 4),\n    u,\n    name: n,\n    mobile: m,\n    role: 'customer',\n    hash: await hash(p),\n    wallet: 0,\n    loginCount: 1,\n    lastLogin: now(),\n    created: now()\n  };\n  D.users.push(newCust);\n  save();\n  activeTab = 'in';\n  toast('Customer ID ban gaya: ' + newCust.id);\n  render();\n}\n\nasync function secretLogin() {\n  await pullLatest();\n  const u = $('#sec_u').value.trim(), p = $('#sec_p').value;\n  const targetRole = secretRole === 'operator' ? 'staff' : 'admin';\n\n  const h = await hash(p);\n  const user = D.users.find(x => x.role === targetRole && x.u === u && x.hash === h);\n  if (!user) return toast('Galat Username ya Password');\n  if (user.locked) return toast('Account locked hai');\n\n  user.loginCount = (user.loginCount || 0) + 1;\n  user.lastLogin = now();\n  save();\n\n  me = user;\n  secretModal = false;\n  view = 'dash';\n  toast(`Welcome ${user.name}`);\n  render();\n}\n\nfunction logout() {\n  me = null;\n  try { sessionStorage.removeItem('pp_me'); } catch (e) {}\n  newCap();\n  render();\n}\n\n/* ==================== 2. MAIN LAYOUT SHELL ==================== */\nfunction render() {\n  if (!me) {\n    $('#root').innerHTML = authView();\n    return;\n  }\n  try { sessionStorage.setItem('pp_me', me.id); } catch (e) {}\n  $('#root').innerHTML = shell(getViewContent());\n}\n\nfunction getViewContent() {\n  switch (view) {\n    case 'dash': return dashView();\n    case 'orders': return ordersView();\n    case 'service_detail': return serviceDetailView();\n    case 'manage_services': return manageServicesView();\n    case 'staff': return staffView();\n    case 'users_track': return usersTrackingView();\n    case 'wallet': return walletView();\n    case 'payments': return paymentsView();\n    case 'qr_settings': return qrSettingsView();\n    case 'portal_settings': return portalSettingsView();\n    case 'complaints': return complaintsView();\n    case 'profile': return profileView();\n    case 'reports': return reportsView();\n    default: return dashView();\n  }\n}\n\nfunction shell(body) {\n  const isAdmin = me.role === 'admin';\n  const isCust = me.role === 'customer';\n\n  return `\n  <div class=\"portal-top-strip\">\n    <div class=\"portal-top-badges\">\n      <div class=\"top-pill-btn\"><span>HOT</span> Manual Print Portal</div>\n      <div class=\"top-pill-btn\"><span>LIVE</span> Document Print Portal</div>\n      <div class=\"top-pill-btn\"><span>FAST</span> RTPS Print Portal</div>\n      <div class=\"top-pill-btn\"><span>24x7</span> 3D Engine Hub</div>\n    </div>\n    <div style=\"display:flex;align-items:center;gap:10px\">\n      ${isCust ? `<span style=\"font-weight:900;color:#facc15;text-shadow:0 0 10px rgba(250,204,21,0.5)\">💳 ${rupee(me.wallet)}</span>` : ''}\n      <div class=\"user-head-tag\">👤 ${esc(me.name)} (${esc(me.id || me.u)})</div>\n    </div>\n  </div>\n\n  <div class=\"main-layout\">\n    <div class=\"left-bar\">\n      <button class=\"dash-btn-sq\" onclick=\"view='dash';render()\">⊞ Dashboard</button>\n\n      ${isCust ? `\n        <div class=\"wallet-box-side\" onclick=\"view='wallet';render()\" style=\"cursor:pointer\">\n          <div><small style=\"opacity:0.9\">Balance</small><br><b style=\"font-size:16px\">${rupee(me.wallet)}</b></div>\n          <button class=\"btn s\" style=\"background:#fff;color:#059669;padding:2px 8px;font-weight:800\">+ Add</button>\n        </div>\n      ` : ''}\n\n      <div style=\"margin-top:12px\">\n        <a class=\"side-menu-link ${view === 'dash' ? 'on' : ''}\" onclick=\"view='dash';render()\">🏠 Dashboard</a>\n        <a class=\"side-menu-link ${view === 'orders' ? 'on' : ''}\" onclick=\"view='orders';render()\">📋 Orders Queue</a>\n        ${isCust ? `<a class=\"side-menu-link ${view === 'wallet' ? 'on' : ''}\" onclick=\"view='wallet';render()\">💳 Wallet / Add Money</a>` : ''}\n        \n        ${isAdmin ? `\n          <div style=\"font-size:10px;font-weight:900;color:#64748b;padding:12px 6px 4px;text-transform:uppercase;letter-spacing:0.5px\">MASTER CONTROL</div>\n          <a class=\"side-menu-link ${view === 'manage_services' ? 'on' : ''}\" onclick=\"view='manage_services';render()\">⚙️ Services & Fields Builder</a>\n          <a class=\"side-menu-link ${view === 'staff' ? 'on' : ''}\" onclick=\"view='staff';render()\">🪪 Staff & Permissions</a>\n          <a class=\"side-menu-link ${view === 'users_track' ? 'on' : ''}\" onclick=\"view='users_track';render()\">👥 Customer Logins & Passwords</a>\n          <a class=\"side-menu-link ${view === 'qr_settings' ? 'on' : ''}\" onclick=\"view='qr_settings';render()\">💳 Payment & QR Settings</a>\n          <a class=\"side-menu-link ${view === 'payments' ? 'on' : ''}\" onclick=\"view='payments';render()\">💰 Verify UTR Payments</a>\n          <a class=\"side-menu-link ${view === 'portal_settings' ? 'on' : ''}\" onclick=\"view='portal_settings';render()\">🛠️ Full Portal Customizer</a>\n        ` : ''}\n\n        ${isAdmin ? `<a class=\"side-menu-link ${view === 'reports' ? 'on' : ''}\" onclick=\"view='reports';render()\">📊 Reports & Backup</a>` : ''}\n        ${isAdmin || isCust ? `<a class=\"side-menu-link ${view === 'complaints' ? 'on' : ''}\" onclick=\"view='complaints';render()\">🎧 ${isAdmin ? 'Complaints Desk (' + D.complaints.filter(t => t.status === 'Open').length + ')' : 'Complaint / Help'}</a>` : ''}\n        ${isCust && waLink() ? `<a class=\"side-menu-link\" href=\"${esc(waLink())}\" target=\"_blank\" rel=\"noopener\">💬 WhatsApp Group Join</a>` : ''}\n        <a class=\"side-menu-link ${view === 'profile' ? 'on' : ''}\" onclick=\"view='profile';render()\">🔑 Profile / Password</a>\n        <a class=\"side-menu-link\" onclick=\"logout()\" style=\"color:#f87171;margin-top:24px\">🚪 Logout</a>\n      </div>\n    </div>\n\n    <div class=\"content-area\">\n      ${body}\n    </div>\n  </div>\n  ${showSuccessModal ? successModalView() : ''}\n  `;\n}\n\n/* ==================== 3. 3D DASHBOARD (IMAGE 10/11 COMBINED) ==================== */\nfunction dashView() {\n  const isStaff = me.role === 'staff';\n  const mySvcIds = isStaff ? (me.services || []) : null;\n\n  const availServices = D.services.filter(s => {\n    if (!s.on) return false;\n    if (isStaff && !mySvcIds.includes('ALL') && !mySvcIds.includes(s.id)) return false;\n    if (searchKw && !s.name.toLowerCase().includes(searchKw.toLowerCase())) return false;\n    return true;\n  });\n\n  return dashExtras() + `\n  <div class=\"sub-portal-strip\">\n    <div class=\"sub-portal-card\">📄 Manual Print Portal</div>\n    <div class=\"sub-portal-card\">🆔 Instant Portal</div>\n    <div class=\"sub-portal-card\">📜 RTPS Portal</div>\n    <div class=\"sub-portal-card\">🚗 Driving License</div>\n    <div class=\"sub-portal-card\">⚡ 24x7 Fast Service</div>\n  </div>\n\n  <div class=\"search-banner\">\n    <small>🔍 Services Search — Service ka naam type karein (PAN, Wallet, Voter, License, Add Money...)</small>\n    <input id=\"svc_search\" placeholder=\"Yahan service ka naam type karein...\" value=\"${esc(searchKw)}\" oninput=\"searchKw=this.value;render();keepFocus('svc_search')\">\n  </div>\n\n  <!-- 3D Realistic Dark Ticker Blocks -->\n  <div class=\"ticker-row\">\n    <div class=\"ticker-block\">\n      <div class=\"tb-head\"><span>VOTER PDF</span><span>🟢 LIVE 01:02</span></div>\n      <div class=\"tb-body\">RUDXXX8659</div>\n      <div class=\"tb-foot fail\">● REJECTED (Auto Refunded) <span>28 sec</span></div>\n    </div>\n    <div class=\"ticker-block\">\n      <div class=\"tb-head\"><span>VOTER MOBILE LINK</span><span>🟢 LIVE 01:32</span></div>\n      <div class=\"tb-body\">XCNXXX3977</div>\n      <div class=\"tb-foot success\">● SUCCESS COMPLETED <span>74 sec</span></div>\n    </div>\n    <div class=\"ticker-block\">\n      <div class=\"tb-head\"><span>LL EXAM</span><span>🟢 LIVE 01:10</span></div>\n      <div class=\"tb-body\">494XXX7826</div>\n      <div class=\"tb-foot success\">● SUCCESS COMPLETED <span>11 sec</span></div>\n    </div>\n  </div>\n\n  <!-- 3D Large Elevated Feature Cards -->\n  <div class=\"feat-grid\">\n    <div class=\"feat-card\" onclick=\"openServiceDetail('SRV0001')\">\n      <span class=\"badge-new\">NEW</span>\n      <div style=\"font-size:32px;margin-bottom:6px\">🚗</div>\n      <b>Learning License Request</b>\n      <div style=\"color:var(--p);font-weight:900;font-size:13px;margin-top:6px\">₹80.00</div>\n    </div>\n    <div class=\"feat-card\" onclick=\"openServiceDetail('SRV0002')\">\n      <span class=\"badge-new\">NEW</span>\n      <div style=\"font-size:32px;margin-bottom:6px\">🗳️</div>\n      <b>Instant Voter ID PDF</b>\n      <div style=\"color:var(--p);font-weight:900;font-size:13px;margin-top:6px\">₹20.00</div>\n    </div>\n    <div class=\"feat-card\" onclick=\"openServiceDetail('SRV0005')\">\n      <span class=\"badge-new\">NEW</span>\n      <div style=\"font-size:32px;margin-bottom:6px\">📜</div>\n      <b>Birth Certificate</b>\n      <div style=\"color:var(--p);font-weight:900;font-size:13px;margin-top:6px\">₹50.00</div>\n    </div>\n    <div class=\"feat-card\" onclick=\"openServiceDetail('SRV0003')\">\n      <span class=\"badge-new\">NEW</span>\n      <div style=\"font-size:32px;margin-bottom:6px\">🏍️</div>\n      <b>RC PDF Online</b>\n      <div style=\"color:var(--p);font-weight:900;font-size:13px;margin-top:6px\">₹25.00</div>\n    </div>\n  </div>\n\n  <!-- 3D Neumorphic Services Tiles Grid -->\n  <h4 style=\"margin:24px 0 12px;color:#94a3b8;font-size:11px;text-transform:uppercase;letter-spacing:1px\">ALL ACTIVE SERVICES</h4>\n  <div class=\"services-3d-grid\">\n    ${availServices.map(s => `\n      <div class=\"mini-tile\" onclick=\"openServiceDetail('${s.id}')\">\n        <div class=\"m-ico\">${esc(s.icon || '📄')}</div>\n        <b>${esc(s.name)}</b>\n        <div class=\"m-rate\">${rupee(s.price)}</div>\n      </div>\n    `).join('') || '<div class=\"card\" style=\"grid-column:1/-1;text-align:center\">Koi service uplabdh nahi hai</div>'}\n  </div>\n\n  <div class=\"card\">\n    <h3 style=\"margin-bottom:12px;font-size:15px;color:#f8fafc\">Recent Orders Queue</h3>\n    ${ordersTable(myOrders().slice(0, 5))}\n  </div>`;\n}\n\nconst myOrders = () => {\n  if (me.role === 'admin') return D.orders;\n  if (me.role === 'staff') {\n    const assigned = me.services || [];\n    return assigned.includes('ALL') ? D.orders : D.orders.filter(o => assigned.includes(o.sid));\n  }\n  return D.orders.filter(o => o.uid === me.id);\n};\n\n/* ==================== 4. SERVICE DETAIL (SPLIT VIEW) ==================== */\nlet selectedService = null;\nfunction openServiceDetail(id) {\n  selectedService = D.services.find(x => x.id === id);\n  view = 'service_detail';\n  render();\n}\n\nfunction serviceDetailView() {\n  const s = selectedService;\n  if (!s) return '<div class=\"card\">Service nahi mili</div>';\n\n  const defaultInstr = [\n    'Video dekhna anivarya hai: Data lagane se pehle test instructions dhyan se padhein.',\n    'Password: Sahi mobile/SMS password darj karein.',\n    'Duplicate Data Warning: Ek hi application number bar-bar submit na karein.',\n    'Approval Time: Data process hone ka samay 15 se 30 minute hai.'\n  ];\n  const instrList = (s.instructions && s.instructions.length) ? s.instructions : defaultInstr;\n  const low = me.wallet < s.price;\n\n  return `\n  <div style=\"margin-bottom:14px\">\n    <button class=\"btn s\" onclick=\"view='dash';render()\">← Back to Services</button>\n  </div>\n\n  <div class=\"detail-layout\">\n    <div class=\"app-form-box\">\n      <div class=\"app-form-header\">\n        <span>🎓</span> ${esc(s.name)}\n      </div>\n      <div class=\"app-form-body\">\n        ${(s.fields || []).map((f, i) => `\n          <div>\n            <label>${esc(f.label)} ${f.req ? '<span style=\"color:var(--bad)\">*</span>' : '<span style=\"color:var(--mut);font-weight:400\">(Optional)</span>'}</label>\n            ${f.type === 'dropdown' ? `\n              <select id=\"sf_${i}\">\n                ${(f.opts || '').split(',').map(o => `<option value=\"${esc(o.trim())}\">${esc(o.trim())}</option>`).join('')}\n              </select>\n            ` : f.type === 'file' ? `\n              <input id=\"sf_${i}\" type=\"file\">\n            ` : `\n              <input id=\"sf_${i}\" type=\"${f.type}\" placeholder=\"${esc(f.placeholder || f.label)}\">\n            `}\n            ${f.hint ? `<span class=\"field-hint\">${esc(f.hint)}</span>` : ''}\n          </div>\n        `).join('')}\n\n        <div class=\"bar-row bar-bal\">\n          <span>💳 Balance:</span>\n          <b>${rupee(me.wallet)}</b>\n        </div>\n        <div class=\"bar-row bar-chg\">\n          <span>🏷️ Charge:</span>\n          <b>${rupee(s.price)}</b>\n        </div>\n\n        ${low ? `<p style=\"color:var(--bad);font-weight:700;margin:8px 0;font-size:11px\">Wallet balance kam hai. Kripya pehle Add Money karein.</p>` : ''}\n\n        <button class=\"btn\" style=\"width:100%;margin-top:12px;padding:12px;background:#4361ee\" onclick=\"submitDirectServiceOrder('${s.id}')\" ${low ? 'disabled' : ''}>\n          ✈ Submit Application (Direct Process)\n        </button>\n      </div>\n    </div>\n\n    <div class=\"instr-panel\">\n      <div class=\"instr-title\">\n        <span>⚠️</span> महत्वपूर्ण निर्देश / Important Instructions\n      </div>\n      \n      <div>\n        ${instrList.map(point => `\n          <div class=\"instr-item\">\n            <span style=\"color:#38bdf8;font-weight:900\">✔</span>\n            <div>${esc(point)}</div>\n          </div>\n        `).join('')}\n      </div>\n\n      <div style=\"background:rgba(255,255,255,0.12);text-align:center;padding:10px;border-radius:8px;font-weight:800;font-size:11px;margin-top:20px;border:1px solid rgba(255,255,255,0.2)\">\n        ✔ PLEASE FILL ALL INFORMATION CAREFULLY ✔\n      </div>\n    </div>\n  </div>`;\n}\n\n// Order Submission Functionality\nasync function submitDirectServiceOrder(id) {\n  const s = D.services.find(x => x.id === id);\n  if (me.wallet < s.price) return toast('Wallet balance kam hai');\n\n  const formData = {};\n  for (let i = 0; i < (s.fields || []).length; i++) {\n    const f = s.fields[i];\n    const el = $('#sf_' + i);\n    if (f.req) {\n      if (f.type === 'file' ? !el.files[0] : !el.value.trim()) {\n        return toast(`${f.label} bharna anivarya hai`);\n      }\n    }\n    if (f.type === 'file') {\n      if (el.files[0]) {\n        formData[f.label] = await new Promise(r => {\n          const fr = new FileReader();\n          fr.onload = () => r(fr.result);\n          fr.readAsDataURL(el.files[0]);\n        });\n      }\n    } else {\n      formData[f.label] = el.value.trim();\n    }\n  }\n\n  me.wallet -= s.price;\n  const ordId = nextId('ORD', 6);\n  D.orders.unshift({\n    id: ordId,\n    sid: s.id,\n    sname: s.name,\n    uid: me.id,\n    uname: me.u,\n    price: s.price,\n    formData,\n    status: 'Pending',\n    t: now()\n  });\n  save();\n\n  toast('Application successfully submit ho gayi: #' + ordId);\n  view = 'orders';\n  render();\n}\n\n/* ==================== 5. WALLET & 5-MIN SUCCESS POPUP ==================== */\nfunction walletView() {\n  const S = D.settings;\n  const myPays = D.pays.filter(p => p.uid === me.id);\n  const upiId = S.upi || 'merchant@upi';\n  const qrImageSrc = S.qr ? S.qr : `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(`upi://pay?pa=${upiId}&pn=${encodeURIComponent(S.title)}&cu=INR`)}`;\n\n  return `\n  <div class=\"two\">\n    <div class=\"card\" style=\"background:#fff;color:#0f172a;box-shadow:0 8px 0 #94a3b8,0 16px 30px rgba(0,0,0,0.3)\">\n      <h3 style=\"margin-bottom:12px;font-size:16px\">Add Money To Wallet (Scan & Pay)</h3>\n      \n      <div class=\"qr-container-3d\">\n        <img class=\"qr-code-img\" src=\"${qrImageSrc}\" alt=\"Payment QR Code\">\n        <div style=\"font-weight:800;font-size:12px;color:#1e3a8a;margin-top:8px\">📲 GooglePay / PhonePe / Paytm</div>\n        <small style=\"color:var(--mut);display:block;margin-top:4px\">Scan karke payment karein</small>\n      </div>\n\n      <p style=\"margin:10px 0;text-align:center;font-size:13px\"><b>UPI ID:</b> <code style=\"background:#e0e7ff;padding:3px 8px;border-radius:6px;color:#1e3a8a;font-weight:700\">${esc(upiId)}</code></p>\n      \n      <label>Kitna Paisa Add Kiya (₹)</label>\n      <input id=\"p_amt\" type=\"number\" min=\"1\" placeholder=\"Enter Amount (e.g. 100)\" style=\"background:#f8fafc;color:#0f172a\">\n      \n      <label>12-Digit Transaction / UTR Number</label>\n      <input id=\"p_utr\" placeholder=\"Enter 12 digit UTR Number\" style=\"background:#f8fafc;color:#0f172a\">\n      \n      <button class=\"btn g\" style=\"width:100%;margin-top:8px;padding:11px\" onclick=\"submitPayWithPopup()\">Submit Payment Verification</button>\n    </div>\n\n    <div class=\"card\">\n      <h3 style=\"margin-bottom:12px;font-size:16px;color:#f8fafc\">Payment History</h3>\n      ${myPays.map(p => `\n        <div style=\"padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.08);display:flex;justify-content:space-between;align-items:center\">\n          <div><b>₹${p.amt}</b> <small style=\"color:#94a3b8\">— UTR: ${esc(p.utr)}</small></div>\n          <span class=\"tag ${p.status}\">${p.status}</span>\n        </div>\n      `).join('') || '<p style=\"color:var(--mut)\">Koi payment request nahi hai</p>'}\n    </div>\n  </div>`;\n}\n\nfunction submitPayWithPopup() {\n  const a = +$('#p_amt').value, u = $('#p_utr').value.trim();\n  if (!(a > 0) || u.length < 6) return toast('Sahi amount aur 12 digit UTR dalein');\n\n  const payId = nextId('PAY', 4);\n  D.pays.unshift({ id: payId, uid: me.id, uname: me.u, amt: a, utr: u, status: 'Pending', t: now() });\n  save();\n\n  showSuccessModal = true;\n  render();\n}\n\nfunction successModalView() {\n  return `\n  <div class=\"success-modal-overlay\">\n    <div class=\"success-modal\">\n      <div class=\"check-circle\" style=\"width:64px;height:64px;background:#10b981;border-radius:50%;color:#fff;display:grid;place-items:center;font-size:32px;margin:0 auto 16px;box-shadow:0 6px 18px rgba(16,185,129,0.4)\">✔</div>\n      <h3 style=\"font-size:18px;margin-bottom:8px\">Request Submitted!</h3>\n      <p style=\"font-size:13px;color:#475569;line-height:1.5;margin-bottom:20px\">Aapki payment request aur UTR Number safalta se submit ho gaya hai.<br><br><b style=\"color:#0f172a\">Aapke wallet me 5 minute ke andar paisa verify karke add kar diya jayega.</b></p>\n      <button class=\"btn g\" style=\"width:100%;padding:11px\" onclick=\"showSuccessModal=false;view='dash';render()\">Theek Hai / Back to Dashboard</button>\n    </div>\n  </div>`;\n}\n\n/* ==================== 6. ADMIN: ORDER DATA VIEWER ==================== */\nfunction ordersView() {\n  const o = myOrders();\n  return `<div class=\"card\"><h3 style=\"margin-bottom:14px;color:#f8fafc\">Orders List (${o.length})</h3>${ordersTable(o)}</div>`;\n}\n\nfunction ordersTable(list) {\n  return list.length ? `\n  <div class=\"tw\"><table>\n    <tr><th>Order ID</th><th>Service</th><th>User</th><th>Price</th><th>Customer Submitted Data</th><th>Status</th><th>File / Action</th></tr>\n    ${list.map(o => `\n      <tr>\n        <td><b>#${o.id}</b></td>\n        <td>${esc(o.sname)}</td>\n        <td>${esc(o.uname)}</td>\n        <td><b>${rupee(o.price)}</b></td>\n        <td>\n          <button class=\"btn s\" style=\"background:#4f46e5\" onclick=\"viewCustomerDataModal('${o.id}')\">🔍 View Data</button>\n        </td>\n        <td><span class=\"tag ${o.status === 'Completed' ? 'Completed' : o.status === 'Rejected' ? 'Rejected' : 'Pending'}\">${o.status}</span></td>\n        <td>\n          ${o.file ? `<a class=\"btn s o\" href=\"${o.file}\" download=\"${esc(o.fname || 'result')}\" style=\"color:#fff;text-decoration:none\">⬇ Download</a>` : ''}\n          ${(me.role === 'admin' || me.role === 'staff') && o.status === 'Pending' ? `\n            <label class=\"btn s g\">Upload Result<input type=\"file\" hidden onchange=\"uploadOrderResult('${o.id}', this)\"></label>\n            <button class=\"btn s r\" onclick=\"rejectAndAutoRefundOrder('${o.id}')\">Reject & Refund</button>\n          ` : ''}\n        </td>\n      </tr>\n    `).join('')}\n  </table></div>` : '<p style=\"text-align:center;padding:16px;color:var(--mut)\">Koi order record nahi hai</p>';\n}\n\nfunction viewCustomerDataModal(id) {\n  const o = D.orders.find(x => x.id === id);\n  if (!o) return;\n  const dataEntries = Object.entries(o.formData || {});\n\n  const rows = dataEntries.map(([k, v]) => `\n    <tr>\n      <td style=\"font-weight:700;color:#1e3a8a;width:40%;background:#f8fafc\">${esc(k)}</td>\n      <td style=\"background:#fff\">\n        ${String(v).startsWith('data:') ? `\n          <a class=\"btn s\" href=\"${v}\" download=\"${esc(k)}\" style=\"background:#0284c7;color:#fff;text-decoration:none\">⬇ Download Attached File</a>\n        ` : `\n          <b>${esc(v)}</b>\n        `}\n      </td>\n    </tr>\n  `).join('');\n\n  $('#appModal').innerHTML = `\n  <div class=\"success-modal-overlay\" onclick=\"if(event.target===this){$('#appModal').innerHTML='';}\">\n    <div class=\"success-modal\" style=\"text-align:left;max-width:540px;background:#fff\">\n      <div style=\"display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;border-bottom:1px solid #cbd5e1;padding-bottom:10px\">\n        <h3 style=\"font-size:16px;color:#0f172a;margin:0\">Order Data: #${o.id}</h3>\n        <button class=\"btn s r\" onclick=\"$('#appModal').innerHTML=''\">✕ Close</button>\n      </div>\n      <p style=\"margin-bottom:12px;font-size:12px;color:#475569\"><b>Service:</b> ${esc(o.sname)} | <b>User:</b> ${esc(o.uname)}</p>\n      <div class=\"tw\" style=\"max-height:360px;overflow-y:auto;border:1px solid #e2e8f0;border-radius:8px\">\n        <table style=\"width:100%\">\n          ${rows || '<tr><td>Data blank hai</td></tr>'}\n        </table>\n      </div>\n      <button class=\"btn g\" style=\"width:100%;margin-top:16px;padding:10px\" onclick=\"$('#appModal').innerHTML=''\">Theek Hai / Band Karein</button>\n    </div>\n  </div>`;\n}\n\nfunction uploadOrderResult(id, inp) {\n  const f = inp.files[0];\n  if (!f) return;\n  const fr = new FileReader();\n  fr.onload = () => {\n    const o = D.orders.find(x => x.id === id);\n    o.file = fr.result;\n    o.fname = f.name;\n    o.status = 'Completed';\n    save();\n    render();\n    toast('File upload ho gayi aur order Complete hua');\n  };\n  fr.readAsDataURL(f);\n}\n\nfunction rejectAndAutoRefundOrder(id) {\n  if (!confirm('Order reject karke customer ke wallet me refund bhejna hai?')) return;\n  const o = D.orders.find(x => x.id === id);\n  const u = D.users.find(x => x.id === o.uid);\n  if (u) {\n    u.wallet += o.price;\n  }\n  o.status = 'Rejected';\n  save();\n  render();\n  toast('Order reject hua aur ₹' + o.price + ' customer wallet me refund ho gaya!');\n}\n\n/* ==================== 7. ADMIN: CUSTOMER TRACKER ==================== */\nfunction usersTrackingView() {\n  const custs = D.users.filter(u => u.role === 'customer');\n  return `\n  <div class=\"card\">\n    <h3 style=\"margin-bottom:14px;color:#f8fafc\">Customer Logins, Activity & Passwords Tracker (${custs.length})</h3>\n    <div class=\"tw\"><table>\n      <tr>\n        <th>Customer ID</th>\n        <th>Full Name</th>\n        <th>Username</th>\n        <th>Mobile</th>\n        <th>Total Logins</th>\n        <th>Last Login</th>\n        <th>Wallet</th>\n        <th>Action</th>\n      </tr>\n      ${custs.map(c => `\n        <tr>\n          <td><b>${c.id}</b></td>\n          <td>${esc(c.name)}</td>\n          <td><b>${esc(c.u)}</b></td>\n          <td>${esc(c.mobile || '-')}</td>\n          <td><span class=\"tag Processing\">${c.loginCount || 1} Times</span></td>\n          <td><small style=\"color:#94a3b8\">${c.lastLogin || c.created || '-'}</small></td>\n          <td><b style=\"color:#10b981\">${rupee(c.wallet)}</b></td>\n          <td>\n            <button class=\"btn s g\" onclick=\"adminAddWallet('${c.id}')\">+ Bal</button>\n            <button class=\"btn s o\" onclick=\"toggleLock('${c.id}')\">${c.locked ? 'Unlock' : 'Lock'}</button>\n            <button class=\"btn s\" onclick=\"resetCustPw('${c.id}')\">Reset PW</button>\n          </td>\n        </tr>\n      `).join('')}\n    </table></div>\n  </div>`;\n}\n\nfunction adminAddWallet(id) {\n  const a = +prompt('Kitne rupaye wallet me jodna chahte hain?');\n  if (a > 0) {\n    const u = D.users.find(x => x.id === id);\n    if (u) u.wallet += a;\n    save();\n    render();\n    toast('Balance add ho gaya');\n  }\n}\n\nfunction toggleLock(id) {\n  const u = D.users.find(x => x.id === id);\n  if (u) u.locked = !u.locked;\n  save();\n  render();\n}\n\n/* ==================== 8. DYNAMIC SERVICE & FORM BUILDER ==================== */\nlet tempFields = [];\nfunction manageServicesView() {\n  return `\n  <div class=\"card\">\n    <h3 style=\"margin-bottom:14px;color:#f8fafc\">Nayi Service & Documents Add Karein (Customizer)</h3>\n    <div class=\"two\">\n      <div><label>Service Name</label><input id=\"as_name\" placeholder=\"e.g. Learning License Request\"></div>\n      <div><label>Price / Charge (₹)</label><input id=\"as_price\" type=\"number\" value=\"80\"></div>\n      <div><label>Icon Emoji</label><input id=\"as_icon\" value=\"🚗\"></div>\n      <div><label>Category</label>\n        <select id=\"as_cat\"><option value=\"PRINT\">PRINT SERVICES</option><option value=\"CERT\">CERTIFICATES</option></select>\n      </div>\n    </div>\n\n    <h4 style=\"margin:14px 0 8px;color:#38bdf8\">Customer Se Kya-Kya Document / Data Lena Hai (Fields)</h4>\n    <div id=\"field_list\"></div>\n    <button class=\"btn s o\" onclick=\"addFieldRow()\">+ Add Field / Document</button>\n\n    <hr style=\"margin:16px 0;border-color:rgba(255,255,255,0.08)\">\n    <h4 style=\"color:#38bdf8;margin-bottom:6px\">Right Box Instructions Customize Karein</h4>\n    <textarea id=\"as_instr\" rows=\"3\" placeholder=\"Video dekhna anivarya hai...&#10;Password SMS wala darj karein...\"></textarea>\n\n    <button class=\"btn g\" style=\"margin-top:12px\" onclick=\"saveFullCustomService()\">Save Service Complete</button>\n  </div>\n\n  <div class=\"card\">\n    <h3 style=\"margin-bottom:14px;color:#f8fafc\">Existing Services (${D.services.length})</h3>\n    <div class=\"tw\"><table>\n      <tr><th>ID</th><th>Service Name</th><th>Price</th><th>Fields Count</th><th>Status</th><th>Action</th></tr>\n      ${D.services.map(s => `\n        <tr>\n          <td><b>${s.id}</b></td>\n          <td>${esc(s.icon || '📄')} ${esc(s.name)}</td>\n          <td>${rupee(s.price)}</td>\n          <td>${(s.fields || []).length} Fields</td>\n          <td><span class=\"tag ${s.on ? 'Completed' : 'Rejected'}\">${s.on ? 'Active' : 'Off'}</span></td>\n          <td>\n            <button class=\"btn s o\" onclick=\"toggleService('${s.id}')\">Toggle</button>\n            <button class=\"btn s r\" onclick=\"deleteService('${s.id}')\">Delete</button>\n          </td>\n        </tr>\n      `).join('')}\n    </table></div>\n  </div>`;\n}\n\nfunction addFieldRow() {\n  tempFields.push({ label: '', type: 'text', placeholder: '', hint: '', opts: '', req: true });\n  renderFieldRows();\n}\n\nfunction renderFieldRows() {\n  const el = $('#field_list');\n  if (!el) return;\n  el.innerHTML = tempFields.map((f, i) => `\n    <div class=\"frow\">\n      <input placeholder=\"Field / Document Name\" value=\"${esc(f.label)}\" oninput=\"tempFields[${i}].label=this.value\">\n      <select onchange=\"tempFields[${i}].type=this.value\">\n        <option value=\"text\" ${f.type === 'text' ? 'selected' : ''}>Text Input</option>\n        <option value=\"password\" ${f.type === 'password' ? 'selected' : ''}>Password</option>\n        <option value=\"date\" ${f.type === 'date' ? 'selected' : ''}>Date of Birth</option>\n        <option value=\"dropdown\" ${f.type === 'dropdown' ? 'selected' : ''}>Dropdown Menu</option>\n        <option value=\"file\" ${f.type === 'file' ? 'selected' : ''}>File Upload</option>\n      </select>\n      <input placeholder=\"Hint / Dropdown Options\" value=\"${esc(f.type === 'dropdown' ? f.opts : f.hint)}\" oninput=\"${f.type === 'dropdown' ? `tempFields[${i}].opts=this.value` : `tempFields[${i}].hint=this.value`}\">\n      <button class=\"btn s r\" onclick=\"tempFields.splice(${i},1);renderFieldRows()\">✕</button>\n    </div>\n  `).join('');\n}\n\nfunction saveFullCustomService() {\n  const name = $('#as_name').value.trim();\n  const price = +$('#as_price').value || 0;\n  if (!name) return toast('Service Name zaroori hai');\n\n  const lines = $('#as_instr').value.split('\\n').map(x => x.trim()).filter(Boolean);\n  const srvId = nextId('SRV', 4);\n\n  D.services.push({\n    id: srvId,\n    name,\n    price,\n    cat: $('#as_cat').value,\n    icon: $('#as_icon').value || '📄',\n    on: true,\n    fields: tempFields.filter(f => f.label.trim()),\n    instructions: lines\n  });\n\n  tempFields = [];\n  save();\n  toast('Nayi service jud gayi: ' + srvId);\n  render();\n}\n\nfunction toggleService(id) {\n  const s = D.services.find(x => x.id === id);\n  if (s) s.on = !s.on;\n  save();\n  render();\n}\n\nfunction deleteService(id) {\n  if (confirm('Service delete karni hai?')) {\n    D.services = D.services.filter(x => x.id !== id);\n    save();\n    render();\n  }\n}\n\n/* ==================== 9. STAFF MANAGEMENT ==================== */\nfunction staffView() {\n  const staffList = D.users.filter(u => u.role === 'staff');\n  return `\n  <div class=\"card\">\n    <h3 style=\"margin-bottom:14px;color:#f8fafc\">Staff ID Create Karein & Services Assign Karein</h3>\n    <div class=\"two\">\n      <div><label>Staff Name</label><input id=\"stf_n\"></div>\n      <div><label>Username</label><input id=\"stf_u\"></div>\n      <div><label>Password (min 8)</label><input id=\"stf_p\" type=\"password\"></div>\n    </div>\n\n    <label style=\"margin:12px 0 6px;display:block;color:#38bdf8\">Konsi Services is Staff ko Dikhani Hai (Check karein):</label>\n    <div style=\"display:grid;grid-template-columns:repeat(auto-fill, minmax(200px, 1fr));gap:8px;background:#090e1a;padding:14px;border:1px solid #1e293b;border-radius:10px;margin-bottom:14px\">\n      ${D.services.map(s => `\n        <label style=\"font-weight:600;font-size:12px;display:flex;align-items:center;gap:6px;color:#f8fafc\">\n          <input type=\"checkbox\" class=\"stf_svc_check\" value=\"${s.id}\" style=\"width:auto;margin:0\">\n          ${esc(s.icon || '📄')} ${esc(s.name)}\n        </label>\n      `).join('')}\n    </div>\n\n    <button class=\"btn g\" onclick=\"saveStaffWithAssignedServices()\">+ Create Staff ID</button>\n  </div>\n\n  <div class=\"card\">\n    <h3 style=\"margin-bottom:14px;color:#f8fafc\">Staff List</h3>\n    <div class=\"tw\"><table>\n      <tr><th>Staff ID</th><th>Name</th><th>Username</th><th>Assigned Services</th><th>Action</th></tr>\n      ${staffList.map(s => `\n        <tr>\n          <td><b>${s.id}</b></td>\n          <td>${esc(s.name)}</td>\n          <td>${esc(s.u)}</td>\n          <td>\n            ${(s.services || []).map(sid => {\n              const obj = D.services.find(x => x.id === sid);\n              return `<span class=\"tag Processing\">${obj ? esc(obj.name) : sid}</span>`;\n            }).join(' ') || '<span class=\"tag\">None</span>'}\n          </td>\n          <td><button class=\"btn s r\" onclick=\"deleteStaff('${s.id}')\">Delete</button></td>\n        </tr>\n      `).join('') || '<tr><td colspan=\"5\" style=\"text-align:center\">Koi staff nahi hai</td></tr>'}\n    </table></div>\n  </div>`;\n}\n\nasync function saveStaffWithAssignedServices() {\n  const n = $('#stf_n').value.trim(), u = $('#stf_u').value.trim(), p = $('#stf_p').value;\n  if (!n || !u || p.length < 8) return toast('Sabhi field bharein (password min 8)');\n\n  const checkedSrv = [...document.querySelectorAll('.stf_svc_check:checked')].map(c => c.value);\n  const sId = nextId('STF', 4);\n\n  D.users.push({\n    id: sId,\n    u,\n    name: n,\n    role: 'staff',\n    services: checkedSrv,\n    hash: await hash(p),\n    wallet: 0,\n    loginCount: 0,\n    created: now()\n  });\n  save();\n  toast('Staff ID ' + sId + ' create ho gaya!');\n  render();\n}\n\nfunction deleteStaff(id) {\n  if (confirm('Staff delete karna hai?')) {\n    D.users = D.users.filter(x => x.id !== id);\n    save();\n    render();\n  }\n}\n\n/* ==================== 10. PAYMENT & PORTAL SETTINGS ==================== */\nfunction qrSettingsView() {\n  const S = D.settings;\n  const currentQr = S.qr ? S.qr : `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(`upi://pay?pa=${S.upi || 'merchant@upi'}&pn=${encodeURIComponent(S.title)}&cu=INR`)}`;\n\n  return `\n  <div class=\"card\" style=\"max-width:550px\">\n    <h3 style=\"margin-bottom:14px;color:#f8fafc\">Payment & QR Code Management</h3>\n    <p style=\"color:var(--mut);font-size:12px;margin-bottom:14px\">Yahan se aap customer ke liye UPI ID aur QR Code set kar sakte hain.</p>\n\n    <label>Merchant UPI ID (GPay / PhonePe / Paytm / Bank UPI)</label>\n    <input id=\"set_upi_val\" value=\"${esc(S.upi)}\" placeholder=\"e.g. yourname@okhdfcbank\">\n\n    <label>Upload Apna QR Code Image (Phone ya PC se image chunein)</label>\n    <input type=\"file\" accept=\"image/*\" onchange=\"uploadQrImage(this)\">\n\n    <div style=\"text-align:center;margin:16px 0\">\n      <p style=\"font-size:11px;font-weight:700;color:var(--mut);margin-bottom:8px\">Current QR Preview:</p>\n      <img src=\"${currentQr}\" style=\"width:180px;height:180px;object-fit:contain;border:2px solid #334155;border-radius:10px;background:#fff;padding:8px\">\n      ${S.qr ? `<br><button class=\"btn s r\" style=\"margin-top:8px\" onclick=\"removeUploadedQr()\">Default UPI QR par Reset karein</button>` : ''}\n    </div>\n\n    <button class=\"btn g\" style=\"width:100%\" onclick=\"saveUpiQrSettings()\">Save Payment & QR Settings</button>\n  </div>`;\n}\n\nfunction saveUpiQrSettings() {\n  D.settings.upi = $('#set_upi_val').value.trim();\n  save();\n  toast('Payment UPI Settings update ho gayi!');\n  render();\n}\n\nfunction uploadQrImage(inp) {\n  const f = inp.files[0];\n  if (!f) return;\n  const fr = new FileReader();\n  fr.onload = () => {\n    D.settings.qr = fr.result;\n    save();\n    render();\n    toast('QR Code Image successfully upload ho gayi!');\n  };\n  fr.readAsDataURL(f);\n}\n\nfunction removeUploadedQr() {\n  D.settings.qr = '';\n  save();\n  render();\n  toast('Custom QR hata diya gaya, Default QR active hua.');\n}\n\nfunction paymentsView() {\n  return `\n  <div class=\"card\">\n    <h3 style=\"margin-bottom:14px;color:#f8fafc\">Customer Payment Requests</h3>\n    <div class=\"tw\"><table>\n      <tr><th>ID</th><th>User</th><th>Amount</th><th>UTR Number</th><th>Status</th><th>Action</th></tr>\n      ${D.pays.map(p => `\n        <tr>\n          <td><b>${p.id}</b></td>\n          <td>${esc(p.uname)}</td>\n          <td><b>${rupee(p.amt)}</b></td>\n          <td><b>${esc(p.utr)}</b></td>\n          <td><span class=\"tag ${p.status}\">${p.status}</span></td>\n          <td>\n            ${p.status === 'Pending' ? `\n              <button class=\"btn s g\" onclick=\"verifyPay('${p.id}', 1)\">Approve</button>\n              <button class=\"btn s r\" onclick=\"verifyPay('${p.id}', 0)\">Reject</button>\n            ` : 'Done'}\n          </td>\n        </tr>\n      `).join('') || '<tr><td colspan=\"6\" style=\"text-align:center\">Koi pending UTR nahi hai</td></tr>'}\n    </table></div>\n  </div>`;\n}\n\nfunction verifyPay(id, ok) {\n  const p = D.pays.find(x => x.id === id);\n  if (!p || p.status !== 'Pending') return;\n  if (ok) {\n    const u = D.users.find(x => x.id === p.uid);\n    if (u) u.wallet += p.amt;\n    p.status = 'Completed';\n  } else {\n    p.status = 'Rejected';\n  }\n  save();\n  render();\n  toast(ok ? 'Approved & Balance Added' : 'Payment Rejected');\n}\n\nfunction portalSettingsView() {\n  const S = D.settings;\n  return `\n  <div class=\"card\" style=\"max-width:600px\">\n    <h3 style=\"margin-bottom:14px;color:#f8fafc\">Full Portal Customizer</h3>\n    <label>Portal Title / Brand Name</label><input id=\"set_t\" value=\"${esc(S.title)}\">\n    <label>Portal Subtitle / Description</label><input id=\"set_sub\" value=\"${esc(S.sub)}\">\n    <label>Login Page Notice Banner</label><textarea id=\"set_not\" rows=\"3\">${esc(S.notice)}</textarea>\n    <label>WhatsApp Group / Channel Link (https://chat.whatsapp.com/... ya https://wa.me/...)</label><input id=\"set_wa\" value=\"${esc(S.waLink)}\" placeholder=\"https://chat.whatsapp.com/xxxx\">\n    <button class=\"btn g\" style=\"margin-top:12px\" onclick=\"savePortalCustomizer()\">Save All Settings</button>\n  </div>`;\n}\n\nfunction savePortalCustomizer() {\n  D.settings.title = $('#set_t').value.trim();\n  D.settings.sub = $('#set_sub').value.trim();\n  D.settings.notice = $('#set_not').value.trim();\n  D.settings.waLink = $('#set_wa').value.trim();\n  save();\n  toast('Portal Settings successfully save ho gayi hain!');\n  render();\n}\n\n$('#root').innerHTML = '<div style=\"padding:60px 16px;text-align:center;color:#94a3b8;font-weight:700\">Loading...</div>';\nbootRemote();\n\n/* ==================== EXTRA: 3D TILT, COMPLAINTS, WHATSAPP, PROFILE, REPORTS ==================== */\ndocument.addEventListener('mousemove', e => {\n  const t = e.target.closest && e.target.closest('.feat-card,.mini-tile');\n  if (!t) return;\n  const r = t.getBoundingClientRect();\n  t.style.setProperty('--ry', ((e.clientX - r.left) / r.width - .5) * 16 + 'deg');\n  t.style.setProperty('--rx', (.5 - (e.clientY - r.top) / r.height) * 16 + 'deg');\n});\ndocument.addEventListener('mouseout', e => {\n  const t = e.target.closest && e.target.closest('.feat-card,.mini-tile');\n  if (t && !t.contains(e.relatedTarget)) { t.style.setProperty('--rx', '0deg'); t.style.setProperty('--ry', '0deg'); }\n});\nconst keepFocus = id => { const el = $('#' + id); if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); } };\nconst waLink = () => { const w = (D.settings.waLink || '').trim(); return /^https:\\/\\//i.test(w) ? w : ''; };\nconst stat = (c, l, v) => `<div class=\"stat ${c}\"><small>${l}</small><b>${v}</b></div>`;\n\nfunction dashExtras() {\n  const o = myOrders(), cnt = s => o.filter(x => x.status === s).length;\n  if (me.role === 'customer') {\n    return `<div class=\"stat-grid\">${stat('ok', 'Wallet Balance', rupee(me.wallet))}${stat('inf', 'Total Orders', o.length)}${stat('warn', 'Pending', cnt('Pending'))}${stat('ok', 'Completed', cnt('Completed'))}</div>\n    <div class=\"help-row\">\n      <button class=\"btn\" onclick=\"view='wallet';render()\">💳 Add Money</button>\n      <button class=\"btn o\" onclick=\"view='complaints';render()\">🎧 Complaint Karein</button>\n      ${waLink() ? `<a class=\"btn wa\" href=\"${esc(waLink())}\" target=\"_blank\" rel=\"noopener\" style=\"text-decoration:none\">💬 WhatsApp Group Join Karein</a>` : ''}\n    </div>`;\n  }\n  if (me.role === 'admin') {\n    const rev = D.orders.filter(x => x.status === 'Completed').reduce((a, x) => a + x.price, 0);\n    const today = new Date().toLocaleDateString('en-IN');\n    return `<div class=\"stat-grid\">\n      ${stat('ok', 'Revenue (Completed)', rupee(rev))}\n      ${stat('inf', 'Orders Today', D.orders.filter(x => String(x.t).startsWith(today)).length)}\n      ${stat('warn', 'Pending Orders', cnt('Pending'))}\n      ${stat('inf', 'Customers', D.users.filter(u => u.role === 'customer').length)}\n      ${stat('warn', 'Payments to Verify', D.pays.filter(p => p.status === 'Pending').length)}\n      ${stat('bad', 'Open Complaints', D.complaints.filter(t => t.status === 'Open').length)}\n    </div>`;\n  }\n  return `<div class=\"stat-grid\">${stat('warn', 'Pending Orders', cnt('Pending'))}${stat('ok', 'Completed', cnt('Completed'))}</div>`;\n}\n\nfunction ticketHtml(t, admin) {\n  return `<div class=\"ticket\">\n    <div style=\"display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap\"><b>#${t.id} — ${esc(t.subject)}</b><span class=\"tag ${t.status}\">${t.status}</span></div>\n    <small style=\"color:var(--mut)\">${admin ? esc(t.uname) + ' | ' : ''}${t.oid ? 'Order #' + esc(t.oid) + ' | ' : ''}${esc(t.t)}</small>\n    <p style=\"margin:6px 0\">${esc(t.msg)}</p>\n    ${t.replies.map(r => `<div class=\"reply\"><b>${esc(r.by)}:</b> ${esc(r.text)} <small style=\"color:var(--mut)\">(${esc(r.t)})</small></div>`).join('')}\n    ${admin && t.status === 'Open' ? `<textarea id=\"rp_${t.id}\" rows=\"2\" placeholder=\"Customer ko reply likhein...\" style=\"margin-top:8px\"></textarea>\n      <button class=\"btn s g\" style=\"margin-top:6px\" onclick=\"replyComplaint('${t.id}')\">Reply & Resolve</button>` : ''}\n  </div>`;\n}\n\nfunction complaintsView() {\n  if (me.role === 'admin') {\n    return `<div class=\"card\"><h3 style=\"margin-bottom:12px\">Complaints Desk (${D.complaints.length})</h3>\n      ${D.complaints.map(t => ticketHtml(t, true)).join('') || '<p style=\"color:var(--mut)\">Koi complaint nahi aayi</p>'}</div>`;\n  }\n  const mine = D.complaints.filter(t => t.uid === me.id);\n  return `<div class=\"two\">\n    <div class=\"card\"><h3 style=\"margin-bottom:6px\">🎧 Nayi Complaint / Help Request</h3>\n      <label>Kis Order ke baare me? (optional)</label>\n      <select id=\"cp_o\"><option value=\"\">-- General --</option>${myOrders().map(o => `<option value=\"${o.id}\">#${o.id} — ${esc(o.sname)} (${o.status})</option>`).join('')}</select>\n      <label>Subject</label><input id=\"cp_s\" placeholder=\"Jaise: Order complete nahi hua\">\n      <label>Aapki Problem</label><textarea id=\"cp_m\" rows=\"4\" placeholder=\"Poori detail likhein...\"></textarea>\n      <button class=\"btn o\" style=\"margin-top:12px;width:100%\" onclick=\"submitComplaint()\">Complaint Submit Karein</button>\n      ${waLink() ? `<a class=\"btn wa\" href=\"${esc(waLink())}\" target=\"_blank\" rel=\"noopener\" style=\"display:block;margin-top:12px;text-decoration:none\">💬 WhatsApp Group Join Karein</a>` : ''}\n    </div>\n    <div class=\"card\"><h3 style=\"margin-bottom:12px\">Meri Complaints (${mine.length})</h3>\n      ${mine.map(t => ticketHtml(t, false)).join('') || '<p style=\"color:var(--mut)\">Abhi tak koi complaint nahi</p>'}</div>\n  </div>`;\n}\n\nfunction submitComplaint() {\n  const s = $('#cp_s').value.trim(), m = $('#cp_m').value.trim();\n  if (!s || !m) return toast('Subject aur problem dono likhein');\n  D.complaints.unshift({ id: nextId('TKT', 4), uid: me.id, uname: me.u, oid: $('#cp_o').value, subject: s, msg: m, status: 'Open', t: now(), replies: [] });\n  save(); toast('Complaint submit ho gayi. Jaldi reply milega.'); render();\n}\n\nfunction replyComplaint(id) {\n  const t = D.complaints.find(x => x.id === id), txt = $('#rp_' + id).value.trim();\n  if (!t || !txt) return toast('Reply likhein');\n  t.replies.push({ by: 'Support', text: txt, t: now() });\n  t.status = 'Resolved'; save(); render(); toast('Reply bhej diya');\n}\n\nfunction profileView() {\n  return `<div class=\"card\" style=\"max-width:480px\"><h3 style=\"margin-bottom:6px\">🔑 Profile & Password</h3>\n    <p style=\"color:var(--mut);margin-bottom:8px\">${esc(me.name)} — ${esc(me.id)} (${esc(me.role)})</p>\n    <label>Purana Password</label><input id=\"pw_old\" type=\"password\">\n    <label>Naya Password (min 8)</label><input id=\"pw_new\" type=\"password\">\n    <button class=\"btn g\" style=\"margin-top:12px\" onclick=\"changeMyPassword()\">Password Badlein</button></div>`;\n}\n\nasync function changeMyPassword() {\n  const o = $('#pw_old').value, n = $('#pw_new').value;\n  if (n.length < 8) return toast('Naya password kam se kam 8 akshar ka ho');\n  if (await hash(o) !== me.hash) return toast('Purana password galat hai');\n  me.hash = await hash(n); save(); toast('Password badal gaya'); render();\n}\n\nasync function resetCustPw(id) {\n  const n = prompt('Customer ka naya password (min 8):');\n  if (!n || n.length < 8) return n === null ? 0 : toast('Password min 8 akshar ka ho');\n  const u = D.users.find(x => x.id === id);\n  if (u) { u.hash = await hash(n); save(); toast('Password reset ho gaya. Customer ko bata dein.'); }\n}\n\nfunction reportsView() {\n  const total = D.orders.length, done = D.orders.filter(o => o.status === 'Completed').length;\n  const pct = total ? Math.round(done * 100 / total) : 0;\n  return `<div class=\"card\"><h3 style=\"margin-bottom:10px\">📊 Reports</h3>\n    <p style=\"margin-bottom:6px\">Success rate: <b>${pct}%</b> (${done}/${total} orders)</p><div class=\"pbar\"><i style=\"width:${pct}%\"></i></div>\n    <div class=\"help-row\" style=\"margin-top:16px\">\n      <button class=\"btn s\" onclick=\"exportCSV('orders')\">⬇ Orders CSV</button>\n      <button class=\"btn s\" onclick=\"exportCSV('customers')\">⬇ Customers CSV</button>\n      <button class=\"btn s\" onclick=\"exportCSV('payments')\">⬇ Payments CSV</button></div></div>\n  <div class=\"card\"><h3 style=\"margin-bottom:6px\">💾 Backup & Restore</h3>\n    <p style=\"color:var(--mut);margin-bottom:10px\">Data sirf is browser me save hai. Roz backup download karke rakhein.</p>\n    <button class=\"btn g\" onclick=\"backupData()\">⬇ Full Backup (JSON)</button>\n    <label class=\"btn o\" style=\"margin-left:8px\">⬆ Restore Backup<input type=\"file\" accept=\".json\" hidden onchange=\"restoreData(this)\"></label></div>`;\n}\n\nfunction download(name, text, type) {\n  const a = document.createElement('a');\n  a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name; a.click();\n  setTimeout(() => URL.revokeObjectURL(a.href), 1000);\n}\nfunction exportCSV(kind) {\n  const cell = v => '\"' + String(v ?? '').replace(/\"/g, '\"\"') + '\"';\n  const rows = {\n    orders: [['ID', 'Service', 'User', 'Price', 'Status', 'Time'], ...D.orders.map(o => [o.id, o.sname, o.uname, o.price, o.status, o.t])],\n    customers: [['ID', 'Name', 'Username', 'Mobile', 'Wallet', 'Logins', 'Locked'], ...D.users.filter(u => u.role === 'customer').map(u => [u.id, u.name, u.u, u.mobile, u.wallet, u.loginCount, !!u.locked])],\n    payments: [['ID', 'User', 'Amount', 'UTR', 'Status', 'Time'], ...D.pays.map(p => [p.id, p.uname, p.amt, p.utr, p.status, p.t])]\n  }[kind];\n  download(kind + '.csv', rows.map(r => r.map(cell).join(',')).join('\\n'), 'text/csv');\n}\nfunction backupData() { download('print-portal-backup.json', JSON.stringify(D), 'application/json'); }\nfunction restoreData(inp) {\n  const f = inp.files[0]; if (!f) return;\n  const fr = new FileReader();\n  fr.onload = () => {\n    try {\n      const x = JSON.parse(fr.result);\n      if (!x.users || !x.services) throw 0;\n      if (!confirm('Current data replace ho jayega. Aage badhein?')) return;\n      localStorage.setItem('pp_core', fr.result); location.reload();\n    } catch (e) { toast('Backup file sahi nahi hai'); }\n  };\n  fr.readAsText(f);\n}\n\n// Page refresh par login bana rahe\nfunction restoreSession() {\n  try { const sid = sessionStorage.getItem('pp_me'); if (sid) { me = D.users.find(x => x.id === sid) || null; if (me) render(); } } catch (e) {}\n}\n"],
-  '/style.css': ['text/css; charset=utf-8', ":root{--p:#38bdf8;--bg:#0b1220;--card:#131c2e;--edge:#070c16;--mut:#94a3b8;--bad:#f87171;--ok:#10b981;--warn:#f59e0b;--ind:#6366f1}\n*{box-sizing:border-box;margin:0;padding:0}\nbody{-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;font-family:'Segoe UI',system-ui,'Noto Sans Devanagari',sans-serif;background:radial-gradient(1200px 600px at 10% -10%,#1e3a8a55,transparent),radial-gradient(900px 500px at 100% 0,#6366f133,transparent),var(--bg);color:#e2e8f0;min-height:100vh;font-size:14px}\na{cursor:pointer}\nlabel{display:block;font-size:12px;font-weight:700;color:#cbd5e1;margin:10px 0 4px}\ninput,select,textarea{width:100%;padding:10px 12px;border-radius:10px;border:1px solid #26344d;background:#0a1322;color:#f1f5f9;font:inherit;box-shadow:inset 0 3px 6px rgba(0,0,0,.45);outline:none}\ninput:focus,select:focus,textarea:focus{border-color:var(--p);box-shadow:inset 0 3px 6px rgba(0,0,0,.45),0 0 0 3px #38bdf833}\n:focus-visible{outline:2px solid var(--p);outline-offset:2px}\n/* 3D buttons: thick bottom edge that presses down */\n.btn{display:inline-block;border:0;cursor:pointer;font:inherit;font-weight:800;color:#fff;background:#3b82f6;padding:9px 16px;border-radius:10px;box-shadow:0 5px 0 #1d4ed8,0 10px 16px rgba(0,0,0,.4);transition:transform .08s,box-shadow .08s;text-align:center}\n.btn:hover{filter:brightness(1.1)}\n.btn:active{transform:translateY(4px);box-shadow:0 1px 0 #1d4ed8,0 3px 6px rgba(0,0,0,.4)}\n.btn:disabled{opacity:.5;cursor:not-allowed}\n.btn.s{padding:5px 10px;font-size:11px;border-radius:8px;box-shadow:0 3px 0 #1e3a8a,0 6px 10px rgba(0,0,0,.35)}\n.btn.s:active{transform:translateY(2px);box-shadow:0 1px 0 #1e3a8a}\n.btn.g{background:#10b981;box-shadow:0 5px 0 #047857,0 10px 16px rgba(0,0,0,.4)}\n.btn.r{background:#ef4444;box-shadow:0 5px 0 #b91c1c,0 10px 16px rgba(0,0,0,.4)}\n.btn.o{background:#f59e0b;color:#1f1300;box-shadow:0 5px 0 #b45309,0 10px 16px rgba(0,0,0,.4)}\n.btn.wa{background:#22c55e;box-shadow:0 5px 0 #15803d,0 10px 16px rgba(0,0,0,.4)}\n.btn.s.g{box-shadow:0 3px 0 #047857}.btn.s.r{box-shadow:0 3px 0 #b91c1c}.btn.s.o{box-shadow:0 3px 0 #b45309}\n/* 3D cards */\n.card{background:linear-gradient(160deg,#17223a,var(--card));border:1px solid #243452;border-radius:16px;padding:18px;margin-bottom:16px;box-shadow:0 6px 0 var(--edge),0 18px 34px rgba(0,0,0,.45),inset 0 1px 0 #ffffff14}\n.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}\n.tw{overflow-x:auto}\ntable{width:100%;border-collapse:collapse;font-size:12px}\nth{text-align:left;padding:9px;color:#7dd3fc;background:#0c172b;white-space:nowrap}\ntd{padding:9px;border-bottom:1px solid #1e2b45;vertical-align:middle}\n.tag{padding:3px 9px;border-radius:99px;font-size:11px;font-weight:800;background:#334155;color:#e2e8f0;display:inline-block}\n.tag.Completed,.tag.Resolved{background:#065f46;color:#a7f3d0}.tag.Rejected{background:#7f1d1d;color:#fecaca}\n.tag.Pending,.tag.Open{background:#78350f;color:#fde68a}.tag.Processing{background:#1e3a8a;color:#bfdbfe}\n/* header + top strip */\n.portal-header,.portal-top-strip{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 18px;background:linear-gradient(#1b2a4a,#101a30);border-bottom:3px solid #000;box-shadow:0 6px 18px rgba(0,0,0,.5)}\n.portal-brand b{font-size:18px;color:#fff}.portal-brand small{color:var(--mut)}\n.portal-top-badges{display:flex;gap:8px;flex-wrap:wrap}\n.top-pill-btn{background:#0a1322;border:1px solid #2a3a5a;border-radius:99px;padding:4px 12px 4px 4px;font-size:11px;font-weight:700;box-shadow:0 3px 0 #000}\n.top-pill-btn span{background:var(--ind);border-radius:99px;padding:2px 8px;margin-right:6px;font-size:10px}\n.user-head-tag{background:#0a1322;border:1px solid #2a3a5a;padding:6px 12px;border-radius:99px;font-weight:700;font-size:12px}\n/* login */\n.login-stage{display:grid;grid-template-columns:1.1fr 1fr;gap:26px;max-width:1080px;margin:34px auto;padding:0 16px;align-items:stretch}\n.stage-left{background:linear-gradient(150deg,#1e40af,#312e81 70%);border-radius:22px;padding:30px;display:flex;flex-direction:column;justify-content:space-between;gap:24px;box-shadow:0 10px 0 #0a1030,0 28px 50px rgba(0,0,0,.55)}\n.stage-left h1{font-size:34px;line-height:1.15;margin:4px 0 10px;text-shadow:0 4px 0 #0a1030}\n.stage-left p{color:#cbd5e1;line-height:1.6}\n.hero-tag{display:inline-block;background:#facc15;color:#422006;font-weight:900;font-size:11px;padding:4px 10px;border-radius:6px;margin-bottom:14px;box-shadow:0 3px 0 #a16207}\n.pill-list{display:grid;gap:8px;margin-top:18px}\n.feature-pill{background:#ffffff1a;border:1px solid #ffffff2e;border-radius:12px;padding:10px 14px;font-weight:600;box-shadow:0 4px 0 #0000004d}\n.stats-bar{display:flex;gap:10px}\n.stats-bar div{flex:1;background:#0000004d;border-radius:12px;padding:10px;text-align:center}\n.stats-bar b{display:block;font-size:20px;color:#facc15}.stats-bar small{color:#cbd5e1}\n.stage-right{background:#f8fafc;color:#0f172a;border-radius:22px;padding:26px;box-shadow:0 10px 0 #94a3b8,0 28px 50px rgba(0,0,0,.5)}\n.stage-right label{color:#334155}.stage-right input{background:#fff;color:#0f172a;border-color:#cbd5e1;box-shadow:inset 0 2px 4px #0000001a}\n.alert-yellow{background:#fef9c3;border:1px solid #fde047;border-radius:10px;padding:10px;font-size:12px;line-height:1.5;margin-bottom:12px;color:#713f12}\n.sub-tabs{display:flex;gap:8px;margin-bottom:8px}\n.sub-tabs button{flex:1;padding:9px;border:0;border-radius:10px;font-weight:800;cursor:pointer;background:#e2e8f0;color:#334155;box-shadow:0 4px 0 #94a3b8}\n.sub-tabs button.on{background:#2563eb;color:#fff;box-shadow:0 4px 0 #1e3a8a}\n.chip-row{display:flex;gap:6px;margin-top:6px}.hint-chip{background:#e0e7ff;color:#3730a3;border-radius:99px;padding:2px 10px;font-size:11px;font-weight:700}\n.captcha-container{display:flex;gap:8px;align-items:center;margin:12px 0}\n.captcha-container span{font-weight:900;background:#0f172a;color:#facc15;padding:9px 14px;border-radius:10px;white-space:nowrap;letter-spacing:2px}\n.captcha-container button{border:0;border-radius:10px;padding:9px 12px;cursor:pointer;font-weight:900}\n.secret-link{text-align:center;margin-top:14px}.secret-link a{color:#94a3b8;font-size:11px}\n.dark-overlay,.success-modal-overlay{position:fixed;inset:0;background:#020617cc;backdrop-filter:blur(4px);display:grid;place-items:center;z-index:50;padding:16px}\n.dark-box{width:min(380px,100%);background:#0f172a;border:1px solid #334155;border-radius:20px;padding:26px;box-shadow:0 10px 0 #020617,0 30px 60px #000}\n.dark-check{width:46px;height:46px;border-radius:50%;background:var(--ind);display:grid;place-items:center;margin:0 auto 8px;font-size:22px;box-shadow:0 5px 0 #3730a3}\n.dark-box h2,.dark-box .sub{text-align:center}.dark-box .sub{color:var(--mut);font-size:12px;margin-bottom:14px}\n.dark-tabs{display:flex;gap:6px;margin-bottom:6px}.dark-tabs button{flex:1;padding:8px;border-radius:10px;border:1px solid #334155;background:#0a1322;color:#cbd5e1;font-weight:700;cursor:pointer}\n.dark-tabs button.on{background:var(--ind);color:#fff;border-color:var(--ind)}\n.success-modal{width:min(420px,100%);background:#fff;color:#0f172a;border-radius:20px;padding:24px;text-align:center;box-shadow:0 10px 0 #94a3b8,0 30px 60px #000}\n.success-modal textarea,.success-modal input,.success-modal select{background:#f8fafc;color:#0f172a;border-color:#cbd5e1}\n.success-modal label{color:#334155;text-align:left}\n/* app shell */\n.main-layout{display:grid;grid-template-columns:250px 1fr;gap:18px;padding:18px;max-width:1400px;margin:0 auto}\n.left-bar{background:linear-gradient(#17223a,#0f1a30);border:1px solid #243452;border-radius:16px;padding:14px;align-self:start;position:sticky;top:12px;box-shadow:0 6px 0 var(--edge),0 18px 30px rgba(0,0,0,.4)}\n.dash-btn-sq{width:100%;padding:10px;border:0;border-radius:10px;background:var(--ind);color:#fff;font-weight:900;cursor:pointer;box-shadow:0 4px 0 #3730a3}\n.wallet-box-side{margin-top:12px;background:linear-gradient(135deg,#059669,#10b981);border-radius:12px;padding:12px;display:flex;justify-content:space-between;align-items:center;box-shadow:0 5px 0 #065f46}\n.side-menu-link{display:block;padding:9px 10px;border-radius:10px;color:#cbd5e1;font-weight:700;font-size:13px;margin-top:4px;transition:transform .15s,background .15s}\n.side-menu-link:hover{background:#ffffff10;transform:translateX(4px)}\n.side-menu-link.on{background:#1e40af;color:#fff;box-shadow:0 3px 0 #1e3a8a}\n.content-area{min-width:0}\n.sub-portal-strip{display:flex;gap:10px;overflow-x:auto;padding:4px 2px 12px}\n.sub-portal-card{flex:0 0 auto;padding:10px 16px;border-radius:12px;background:linear-gradient(#26375c,#1b2946);font-weight:800;box-shadow:0 5px 0 #070c16}\n.search-banner{background:linear-gradient(135deg,#1e3a8a,#4338ca);padding:14px;border-radius:14px;margin-bottom:14px;box-shadow:0 6px 0 #0a1030}\n.search-banner small{display:block;margin-bottom:8px;color:#e0e7ff}\n.ticker-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin-bottom:14px}\n.ticker-block{background:#050a14;border:1px solid #1e2b45;border-radius:12px;overflow:hidden;box-shadow:0 5px 0 #000}\n.tb-head{display:flex;justify-content:space-between;padding:7px 10px;font-size:10px;font-weight:800;color:#7dd3fc;background:#0c172b}\n.tb-body{padding:12px 10px;font:800 18px/1 ui-monospace,Consolas,monospace;letter-spacing:2px;color:#f1f5f9}\n.tb-foot{display:flex;justify-content:space-between;padding:6px 10px;font-size:10px;font-weight:800}\n.tb-foot.fail{color:#fca5a5;background:#450a0a}.tb-foot.success{color:#86efac;background:#052e1b}\n/* 3D service cards (tilt is driven by JS --rx/--ry) */\n.feat-grid,.services-3d-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:16px;perspective:1000px}\n.feat-card,.mini-tile{position:relative;cursor:pointer;text-align:center;border-radius:16px;padding:18px 12px;transform-style:preserve-3d;transform:rotateX(var(--rx,0deg)) rotateY(var(--ry,0deg));transition:transform .15s ease-out,box-shadow .15s}\n.feat-card{background:linear-gradient(160deg,#fff,#dbeafe);color:#0f172a;box-shadow:0 8px 0 #93a8cf,0 20px 30px rgba(0,0,0,.45)}\n.mini-tile{background:linear-gradient(160deg,#1e2c4a,#142038);border:1px solid #2b3d62;box-shadow:0 7px 0 #060b15,0 16px 26px rgba(0,0,0,.4)}\n.feat-card:hover,.mini-tile:hover{box-shadow:0 12px 0 #060b15,0 28px 40px rgba(0,0,0,.55)}\n.feat-card>*,.mini-tile>*{transform:translateZ(26px)}\n.m-ico{font-size:30px;margin-bottom:6px;filter:drop-shadow(0 6px 4px #0008)}.m-rate{color:#facc15;font-weight:900;margin-top:6px}\n.badge-new{position:absolute;top:-8px;right:-6px;background:#ef4444;color:#fff;font-size:10px;font-weight:900;padding:3px 8px;border-radius:99px;box-shadow:0 3px 0 #7f1d1d;transform:translateZ(40px)}\n.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}\n.stat{border-radius:14px;padding:14px;background:linear-gradient(160deg,#1e2c4a,#142038);box-shadow:0 6px 0 #060b15}\n.stat small{color:var(--mut);font-weight:700}.stat b{display:block;font-size:22px;margin-top:4px}\n.stat.ok b{color:#34d399}.stat.warn b{color:#fbbf24}.stat.bad b{color:#f87171}.stat.inf b{color:#7dd3fc}\n.help-row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}\n.ticket{border:1px solid #243452;border-radius:12px;padding:12px;margin-bottom:10px;background:#0f1a30}\n.reply{background:#0a2540;border-left:3px solid var(--p);padding:8px 10px;margin-top:8px;border-radius:8px;font-size:12px}\n.pbar{height:10px;border-radius:99px;background:#0a1322;overflow:hidden;box-shadow:inset 0 2px 3px #000}.pbar i{display:block;height:100%;background:linear-gradient(90deg,#38bdf8,#6366f1)}\n/* service detail */\n.detail-layout{display:grid;grid-template-columns:1.2fr 1fr;gap:18px}\n.app-form-box{background:#fff;color:#0f172a;border-radius:16px;overflow:hidden;box-shadow:0 8px 0 #94a3b8,0 22px 34px rgba(0,0,0,.45)}\n.app-form-header{background:#2563eb;color:#fff;font-weight:900;font-size:16px;padding:14px 18px}\n.app-form-body{padding:16px;display:grid;gap:10px}\n.app-form-body label{color:#334155}.app-form-body input,.app-form-body select{background:#f8fafc;color:#0f172a;border-color:#cbd5e1;box-shadow:inset 0 2px 4px #0000001a}\n.field-hint{font-size:11px;color:#64748b}\n.bar-row{display:flex;justify-content:space-between;padding:10px 14px;border-radius:10px;font-weight:800}\n.bar-bal{background:#dcfce7;color:#166534}.bar-chg{background:#fee2e2;color:#991b1b}\n.instr-panel{background:linear-gradient(160deg,#1d4ed8,#312e81);border-radius:16px;padding:18px;box-shadow:0 8px 0 #0a1030,0 22px 34px rgba(0,0,0,.45);align-self:start}\n.instr-title{font-weight:900;font-size:15px;margin-bottom:12px}\n.instr-item{display:flex;gap:8px;background:#ffffff14;border-radius:10px;padding:10px;margin-bottom:8px;font-size:12px;line-height:1.5}\n.qr-container-3d{text-align:center;background:#f1f5f9;border-radius:14px;padding:14px;box-shadow:inset 0 3px 8px #0003}\n.qr-code-img{width:180px;height:180px;object-fit:contain;background:#fff;padding:8px;border-radius:12px;box-shadow:0 8px 0 #cbd5e1,0 14px 20px #0004;transform:rotateX(8deg) rotateY(-8deg)}\n.frow{display:grid;grid-template-columns:1.2fr 1fr 1.4fr auto;gap:8px;margin-bottom:8px}\n#toast{display:none;position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:#0f172a;color:#fff;border:1px solid var(--p);padding:11px 20px;border-radius:12px;font-weight:700;z-index:99;box-shadow:0 5px 0 #000,0 14px 30px #000a;max-width:92vw}\n@media(max-width:900px){.login-stage,.detail-layout{grid-template-columns:1fr}.stage-left,.stage-right{transform:none}.main-layout{grid-template-columns:1fr}.left-bar{position:static}.frow{grid-template-columns:1fr}}\n@media(prefers-reduced-motion:reduce){*{transition:none!important}.feat-card,.mini-tile{transform:none!important}}\n\n/* Login trust scene: rotating 3D cube */\n.trust-scene{display:flex;align-items:center;gap:22px;background:#0000003a;border:1px solid #ffffff22;border-radius:16px;padding:18px 20px;box-shadow:0 5px 0 #0a1030}\n.cube-wrap{width:110px;height:110px;flex:0 0 110px;display:grid;place-items:center;perspective:500px;position:relative}\n.cube{width:64px;height:64px;position:relative;transform-style:preserve-3d;animation:cubeSpin 14s linear infinite}\n.cube .face{position:absolute;inset:0;display:grid;place-items:center;font-size:26px;border-radius:8px;border:1px solid #ffffff55;background:linear-gradient(135deg,#38bdf8cc,#6366f1cc);box-shadow:inset 0 0 14px #ffffff44}\n.cube .face small{font-size:9px;font-weight:800;margin-top:-10px}\n.f1{transform:translateZ(32px)}.f2{transform:rotateY(90deg) translateZ(32px)}.f3{transform:rotateY(180deg) translateZ(32px)}.f4{transform:rotateY(-90deg) translateZ(32px)}\n.f5{transform:rotateX(90deg) translateZ(32px)}.f6{transform:rotateX(-90deg) translateZ(32px)}\n.cube-shadow{position:absolute;bottom:2px;width:70px;height:12px;border-radius:50%;background:#000;opacity:.35;filter:blur(5px);animation:shadowPulse 3.5s ease-in-out infinite}\n.cube-wrap::before{content:\"\";position:absolute;width:104px;height:104px;border-radius:50%;border:2px dashed #ffffff40;animation:ringSpin 18s linear infinite;transform:rotateX(70deg)}\n.trust-text b{display:block;font-size:15px;margin-bottom:4px}.trust-text span{color:#cbd5e1;font-size:12px;line-height:1.5}\n@keyframes cubeSpin{from{transform:rotateX(-22deg) rotateY(0)}to{transform:rotateX(-22deg) rotateY(360deg)}}\n@keyframes ringSpin{from{transform:rotateX(70deg) rotateZ(0)}to{transform:rotateX(70deg) rotateZ(360deg)}}\n@keyframes shadowPulse{50%{transform:scaleX(.75);opacity:.2}}\n@media(prefers-reduced-motion:reduce){.cube,.cube-wrap::before,.cube-shadow{animation:none}}"]
-};
-PAGES['/index.html'][1] = PAGES['/'][1];
+/* ============================== SESSIONS / SECURITY ============================== */
+const sessions = new Map();                      // sha256(token) -> { uid, exp }
+try {
+  const s = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
+  Object.entries(s).forEach(([k, v]) => { if (v.exp > Date.now()) sessions.set(k, v); });
+} catch (e) { /* no sessions yet */ }
+let sessTimer = null;
+function saveSessions() {
+  clearTimeout(sessTimer);
+  sessTimer = setTimeout(() => {
+    try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(SESSION_FILE, JSON.stringify(Object.fromEntries(sessions))); } catch (e) { /* ignore */ }
+  }, 500);
+}
+function newSession(uid) {
+  const token = crypto.randomBytes(32).toString('hex');
+  sessions.set(sha256(token), { uid, exp: Date.now() + SESSION_TTL });
+  saveSessions();
+  return token;
+}
+function dropUserSessions(uid, exceptKey) {
+  for (const [k, v] of sessions) if (v.uid === uid && k !== exceptKey) sessions.delete(k);
+  saveSessions();
+}
+const parseCookies = h => Object.fromEntries(String(h || '').split(';').map(c => c.trim().split(/=(.*)/s)).filter(a => a[0]).map(a => [a[0], decodeURIComponent(a[1] || '')]));
 
-const send = (res, code, obj) => {
-  res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+const hits = new Map();                          // simple in-memory rate limiter
+const tooMany = (key, max, win) => { const a = (hits.get(key) || []).filter(t => Date.now() - t < win); hits.set(key, a); return a.length >= max; };
+const hit = key => { const a = hits.get(key) || []; a.push(Date.now()); hits.set(key, a); };
+setInterval(() => { for (const [k, a] of hits) { const f = a.filter(t => Date.now() - t < 3600000); f.length ? hits.set(k, f) : hits.delete(k); } for (const [k, v] of captchas) if (v.exp < Date.now()) captchas.delete(k); }, 600000).unref();
+
+const captchas = new Map();
+function newCaptcha() {
+  const a = 1 + Math.floor(Math.random() * 9), b = 1 + Math.floor(Math.random() * 9), id = crypto.randomBytes(8).toString('hex');
+  captchas.set(id, { ans: a + b, exp: Date.now() + 10 * 60000 });
+  return { id, q: a + ' + ' + b };
+}
+function checkCaptcha(id, ans) {
+  const c = captchas.get(String(id)); captchas.delete(String(id));
+  if (!c || c.exp < Date.now() || Number(ans) !== c.ans) bad('Captcha galat hai');
+}
+
+const publicUser = u => u && ({
+  id: u.id, u: u.u, name: u.name, mobile: u.mobile || '', role: u.role, wallet: r2(u.wallet), services: u.services || [],
+  loginCount: u.loginCount || 0, lastLogin: u.lastLogin || '', created: u.created || '', locked: !!u.locked
+});
+
+/* ============================== NOTIFICATIONS (Telegram + WhatsApp) ============================== */
+const notifyLog = [];                            // last 25 attempts, shown to admin for debugging
+const logNotify = (ch, ok, info) => { notifyLog.unshift({ t: now(), ch, ok, info: String(info).slice(0, 200) }); notifyLog.length = Math.min(notifyLog.length, 25); };
+
+function httpRequest(urlStr, opt = {}) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try { u = new URL(urlStr); } catch (e) { return reject(new Error('Invalid URL')); }
+    if (!/^https?:$/.test(u.protocol)) return reject(new Error('Only http/https URLs allowed'));
+    const body = opt.body == null ? null : (typeof opt.body === 'string' ? opt.body : JSON.stringify(opt.body));
+    const headers = Object.assign({}, opt.headers || {});
+    if (body != null) { headers['Content-Type'] = headers['Content-Type'] || 'application/json'; headers['Content-Length'] = Buffer.byteLength(body); }
+    const lib = u.protocol === 'https:' ? https : http;
+    const req = lib.request(u, { method: opt.method || 'GET', headers, timeout: opt.timeout || 8000 }, res => {
+      const chunks = []; let size = 0;
+      res.on('data', c => { size += c.length; if (size < 20000) chunks.push(c); });
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('timeout', () => req.destroy(new Error('Timeout')));
+    req.on('error', reject);
+    if (body != null) req.write(body);
+    req.end();
+  });
+}
+
+async function sendTelegram(msg) {
+  const S = state.settings;
+  const token = str(S.tgBotToken, 200), chats = str(S.tgChatId, 200).split(/[,\s]+/).filter(Boolean);
+  if (!token || !chats.length) return { skipped: true };
+  if (!/^\d+:[\w-]+$/.test(token)) throw new Error('Telegram bot token format is wrong');
+  const html = '<b>' + escHtml(msg.title) + '</b>\n' + msg.lines.map(([k, v]) => escHtml(k) + ': <b>' + escHtml(v) + '</b>').join('\n');
+  for (const chat of chats) {
+    const r = await httpRequest('https://api.telegram.org/bot' + token + '/sendMessage', { method: 'POST', body: { chat_id: chat, text: html, parse_mode: 'HTML', disable_web_page_preview: true } });
+    if (r.status !== 200) throw new Error('Telegram HTTP ' + r.status + ' ' + r.body.slice(0, 120));
+  }
+  return { ok: true };
+}
+async function sendWhatsApp(msg) {
+  const S = state.settings, url = str(S.waWebhook, 1000), key = str(S.waApiKey, 300);
+  if (!url) return { skipped: true };
+  const plain = msg.title + '\n' + msg.lines.map(([k, v]) => k + ': ' + v).join('\n');
+  let r;
+  if (/\{message\}|\{apikey\}/.test(url)) {      // GET gateway style, e.g. https://api.callmebot.com/whatsapp.php?phone=91XXXXXXXXXX&text={message}&apikey={apikey}
+    r = await httpRequest(url.replace(/\{message\}/g, encodeURIComponent(plain)).replace(/\{apikey\}/g, encodeURIComponent(key)));
+  } else {                                        // generic JSON webhook
+    const headers = key ? { Authorization: 'Bearer ' + key, 'x-api-key': key } : {};
+    r = await httpRequest(url, { method: 'POST', headers, body: { event: msg.event, title: msg.title, message: plain, text: plain, data: Object.fromEntries(msg.lines), apiKey: key || undefined } });
+  }
+  if (r.status < 200 || r.status >= 300) throw new Error('WhatsApp HTTP ' + r.status + ' ' + r.body.slice(0, 120));
+  return { ok: true };
+}
+// Non-blocking: caller never waits and can never fail because of this.
+function notify(event, title, lines) {
+  const S = state.settings;
+  const on = { order: S.notifyOrder, deposit: S.notifyDeposit, complaint: S.notifyComplaint }[event];
+  if (!on) return;
+  const msg = { event, title, lines: lines.map(([k, v]) => [k, String(v)]).concat([['Time', now()]]) };
+  setImmediate(() => {
+    for (const [name, fn] of [['Telegram', sendTelegram], ['WhatsApp', sendWhatsApp]]) {
+      Promise.resolve().then(() => fn(msg)).then(r => { if (!r.skipped) logNotify(name, true, event + ' sent'); }).catch(e => logNotify(name, false, e.message));
+    }
+  });
+}
+
+// Optional per-service forwarding: tries endpoint 1, falls back to endpoint 2, 3 ... Result is stored on the order.
+async function dispatchOrder(order, svc) {
+  const eps = (svc.endpoints || []).filter(Boolean);
+  if (!eps.length) return;
+  const formData = {};
+  Object.entries(order.formData || {}).forEach(([k, v]) => { if (typeof v === 'string' && !v.startsWith('data:')) formData[k] = v; });
+  const payload = { orderId: order.id, service: svc.name, server: svc.serverLabel || '', price: order.price, customer: order.uname, formData };
+  const out = [];
+  for (const url of eps) {
+    try {
+      const r = await httpRequest(url, { method: 'POST', body: payload, timeout: 10000 });
+      const ok = r.status >= 200 && r.status < 300;
+      out.push({ url, ok, status: r.status, t: now() });
+      if (ok) break;
+    } catch (e) { out.push({ url, ok: false, status: 0, err: e.message.slice(0, 80), t: now() }); }
+  }
+  order.dispatch = out;
+  try { commit(); } catch (e) { /* ignore */ }
+}
+
+/* ============================== FILES ============================== */
+function saveDataUrl(dataUrl, origName) {
+  const m = /^data:([\w.+/-]*);base64,([A-Za-z0-9+/=\s]+)$/.exec(String(dataUrl || ''));
+  if (!m) bad('File format sahi nahi hai');
+  const buf = Buffer.from(m[2].replace(/\s/g, ''), 'base64');
+  if (buf.length > MAX_FILE_BYTES) bad('File 8 MB se badi hai');
+  const ext = (String(origName || '').split('.').pop() || 'bin').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 8) || 'bin';
+  const name = 'UPL_' + crypto.randomBytes(10).toString('hex') + '.' + ext;
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  fs.writeFileSync(path.join(UPLOAD_DIR, name), buf);
+  return { file: name, name: str(origName, 120) || name, mime: m[1] || 'application/octet-stream', size: buf.length };
+}
+const SAFE_MIME = /^(application\/pdf|image\/(png|jpe?g|gif|webp))$/;
+function sendFileRef(res, ref) {
+  const p = path.join(UPLOAD_DIR, path.basename(ref.file));
+  if (!fs.existsSync(p)) bad('File server par nahi mili', 404);
+  res.writeHead(200, { 'Content-Type': SAFE_MIME.test(ref.mime) ? ref.mime : 'application/octet-stream', 'Content-Disposition': 'attachment; filename="' + encodeURIComponent(ref.name || ref.file) + '"', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, no-store' });
+  fs.createReadStream(p).pipe(res);
+}
+function sendLegacyDataUrl(res, dataUrl, name) {
+  const m = /^data:([\w.+/-]*);base64,(.*)$/s.exec(dataUrl);
+  if (!m) bad('File corrupt hai', 404);
+  res.writeHead(200, { 'Content-Type': SAFE_MIME.test(m[1]) ? m[1] : 'application/octet-stream', 'Content-Disposition': 'attachment; filename="' + encodeURIComponent(name || 'result') + '"', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, no-store' });
+  res.end(Buffer.from(m[2], 'base64'));
+}
+
+/* ============================== VIEW MODELS (what the browser may see) ============================== */
+function svcPublic(s) {
+  return { id: s.id, name: s.name, price: s.price, icon: s.icon, iconUrl: s.iconUrl, cat: s.cat, chip: s.chip, placement: s.placement, group: s.group, serverLabel: s.serverLabel, badge: s.badge, sort: s.sort, on: s.on !== false, fields: s.fields, instructions: s.instructions };
+}
+function orderView(o, admin) {
+  const fd = {};
+  Object.entries(o.formData || {}).forEach(([k, v]) => {
+    if (v && typeof v === 'object' && v.file) fd[k] = { file: true, name: v.name, size: v.size };
+    else if (typeof v === 'string' && v.startsWith('data:')) fd[k] = { file: true, name: k, legacy: true };
+    else fd[k] = v;
+  });
+  const out = { id: o.id, sid: o.sid, sname: o.sname, uid: o.uid, uname: o.uname, price: o.price, status: o.status, t: o.t, formData: fd, hasFile: !!(o.file || o.fileRef), fname: o.fname || (o.fileRef && o.fileRef.name) || '', note: o.note || '' };
+  if (admin) { out.dispatch = o.dispatch || []; out.serverLabel = o.serverLabel || ''; }
+  return out;
+}
+const canSeeOrder = (u, o) => u.role === 'admin' || (u.role === 'customer' && o.uid === u.id) ||
+  (u.role === 'staff' && ((u.services || []).includes('ALL') || (u.services || []).includes(o.sid)));
+const isDesk = u => u.role === 'admin' || u.role === 'staff';
+
+function counts(u) {
+  const o = state.orders;
+  if (u.role === 'customer') return { pending: o.filter(x => x.uid === u.id && x.status === 'Pending').length, openTickets: state.complaints.filter(t => t.uid === u.id && t.status === 'Open').length };
+  const mine = o.filter(x => canSeeOrder(u, x));
+  const c = { pending: mine.filter(x => x.status === 'Pending').length };
+  if (u.role === 'admin') { c.pays = state.pays.filter(p => p.status === 'Pending').length; c.openTickets = state.complaints.filter(t => t.status === 'Open').length; }
+  return c;
+}
+function stats(u) {
+  const o = state.orders;
+  if (u.role === 'customer') { const m = o.filter(x => x.uid === u.id); return { total: m.length, pending: m.filter(x => x.status === 'Pending').length, done: m.filter(x => x.status === 'Completed').length }; }
+  const m = o.filter(x => canSeeOrder(u, x));
+  const s = { total: m.length, pending: m.filter(x => x.status === 'Pending').length, done: m.filter(x => x.status === 'Completed').length };
+  if (u.role === 'admin') {
+    const td = today() + ',';
+    Object.assign(s, {
+      revenue: r2(o.filter(x => x.status === 'Completed').reduce((a, x) => a + (x.price || 0), 0)),
+      today: o.filter(x => String(x.t).startsWith(td)).length,
+      customers: state.users.filter(x => x.role === 'customer').length,
+      pays: state.pays.filter(p => p.status === 'Pending').length,
+      tickets: state.complaints.filter(t => t.status === 'Open').length,
+      wallets: r2(state.users.filter(x => x.role === 'customer').reduce((a, x) => a + (x.wallet || 0), 0))
+    });
+  }
+  return s;
+}
+function publicSettings() {
+  const S = state.settings;
+  return {
+    title: S.title, sub: S.sub, notice: S.notice, waLink: S.waLink,
+    tickerOn: !!S.tickerOn, ticker: String(S.tickerText || '').split('\n').map(x => x.trim()).filter(Boolean), tickerSpeed: S.tickerSpeed || 40,
+    popup: S.popupOn ? { title: S.popupTitle, msg: S.popupMsg, btnText: S.popupBtnText, btnLink: S.popupBtnLink, dismiss: S.popupDismiss, ver: S.popupVer } : null,
+    customCss: S.customCss || '', customHtml: S.customHtml || '', customJs: S.customJs || ''
+  };
+}
+const mask = v => v ? (v.length > 8 ? v.slice(0, 4) + '\u2022\u2022\u2022\u2022' + v.slice(-3) : '\u2022\u2022\u2022\u2022') : '';
+function adminSettings() {
+  const S = Object.assign({}, state.settings);
+  S.tgBotTokenSet = !!S.tgBotToken; S.tgBotTokenMasked = mask(S.tgBotToken); delete S.tgBotToken;
+  S.waApiKeySet = !!S.waApiKey; S.waApiKeyMasked = mask(S.waApiKey); delete S.waApiKey;
+  return S;
+}
+
+/* ============================== SERVICE / SETTINGS VALIDATION ============================== */
+function cleanService(b, old) {
+  const name = str(b.name, 100);
+  if (!name) bad('Service ka naam zaroori hai');
+  const price = r2(b.price);
+  if (!(price >= 0) || price > 100000) bad('Price sahi nahi hai');
+  const iconUrl = str(b.iconUrl, 400000);
+  if (iconUrl && !/^(https?:\/\/|\/|data:image\/)/i.test(iconUrl)) bad('Icon URL https:// se shuru hona chahiye');
+  const fields = (Array.isArray(b.fields) ? b.fields : []).slice(0, 30).map(f => ({
+    label: str(f.label, 80), type: FIELD_TYPES.includes(f.type) ? f.type : 'text', placeholder: str(f.placeholder, 120),
+    hint: str(f.hint, 200), opts: str(f.opts, 1000), req: !!f.req
+  })).filter(f => f.label);
+  const endpoints = (Array.isArray(b.endpoints) ? b.endpoints : String(b.endpoints || '').split('\n')).map(x => str(x, 500)).filter(Boolean).slice(0, 10);
+  endpoints.forEach(e => { if (!/^https?:\/\//i.test(e)) bad('Endpoint https:// se shuru hona chahiye: ' + e); });
+  const instr = (Array.isArray(b.instructions) ? b.instructions : String(b.instructions || '').split('\n')).map(x => str(x, 400)).filter(Boolean).slice(0, 20);
+  return Object.assign({}, old || {}, {
+    name, price, icon: str(b.icon, 16) || '\uD83D\uDCC4', iconUrl, cat: str(b.cat, 20) || (old && old.cat) || 'PRINT',
+    chip: CHIPS.includes(b.chip) ? b.chip : 'manual', placement: PLACEMENTS.includes(b.placement) ? b.placement : 'grid',
+    group: str(b.group, 60), serverLabel: str(b.serverLabel, 40), badge: BADGES.includes(b.badge) ? b.badge : '',
+    sort: Number.isFinite(Number(b.sort)) ? Number(b.sort) : 100, on: b.on === undefined ? (old ? old.on !== false : true) : !!b.on,
+    fields, instructions: instr, endpoints
+  });
+}
+const SETTING_SECTIONS = {
+  portal: { title: ['s', 100], sub: ['s', 300], notice: ['s', 1000], waLink: ['s', 300] },
+  payment: { upi: ['s', 100], qr: ['s', 3000000] },
+  ticker: { tickerOn: ['b'], tickerText: ['s', 4000], tickerSpeed: ['n', 10, 200] },
+  popup: { popupOn: ['b'], popupTitle: ['s', 120], popupMsg: ['s', 3000], popupBtnText: ['s', 40], popupBtnLink: ['s', 500], popupDismiss: ['e', ['session', 'day', 'once', 'always']] },
+  notify: { tgChatId: ['s', 200], waWebhook: ['s', 1000], notifyOrder: ['b'], notifyDeposit: ['b'], notifyComplaint: ['b'] },
+  custom: { customCss: ['s', 200000], customHtml: ['s', 200000], customJs: ['s', 200000] }
+};
+function applySettings(section, v) {
+  const spec = SETTING_SECTIONS[section];
+  if (!spec) bad('Unknown settings section');
+  const S = state.settings;
+  for (const [k, t] of Object.entries(spec)) {
+    if (v[k] === undefined) continue;
+    if (t[0] === 'b') S[k] = !!v[k];
+    else if (t[0] === 'n') S[k] = Math.min(t[2], Math.max(t[1], Number(v[k]) || t[1]));
+    else if (t[0] === 'e') { if (!t[1].includes(v[k])) bad('Invalid value for ' + k); S[k] = v[k]; }
+    else S[k] = String(v[k] == null ? '' : v[k]).slice(0, t[1]).replace(/\r\n/g, '\n');
+  }
+  if (section === 'payment' && S.qr && !/^data:image\//.test(S.qr)) bad('QR image sahi nahi hai');
+  if (/^(javascript|data|vbscript):/i.test(S.waLink || '') || /^(javascript|vbscript):/i.test(S.popupBtnLink || '')) bad('Link https:// se shuru hona chahiye');
+  if (section === 'portal' && !S.title.trim()) bad('Portal title khali nahi ho sakta');
+  if (section === 'popup') S.popupVer = (Number(S.popupVer) || 1) + 1;      // resets everybody's "dismissed" flag
+  if (section === 'notify') {
+    if (v.clearTgToken) S.tgBotToken = '';
+    else if (str(v.tgBotToken, 200) && !/\u2022/.test(v.tgBotToken)) S.tgBotToken = str(v.tgBotToken, 200);
+    if (v.clearWaKey) S.waApiKey = '';
+    else if (str(v.waApiKey, 300) && !/\u2022/.test(v.waApiKey)) S.waApiKey = str(v.waApiKey, 300);
+    if (S.waWebhook && !/^https?:\/\//i.test(S.waWebhook)) bad('WhatsApp webhook URL https:// se shuru hona chahiye');
+  }
+}
+
+const STARTER = [
+  { name: 'Voter Mobile Link', chip: 'voter', placement: 'quick', group: '', fields: [['EPIC Number', 'text'], ['Mobile Number', 'text']], icon: '\uD83D\uDCF2' },
+  { name: 'Learning License Exam', chip: 'exam', placement: 'quick', group: '', fields: [['Application Number', 'text'], ['Date Of Birth', 'date']], icon: '\uD83D\uDCDD' },
+  { name: 'PUC Certificate', chip: 'vehicle', placement: 'quick', group: '', fields: [['Vehicle Number', 'text'], ['Mobile Number', 'text']], icon: '\uD83C\uDF3F' },
+  { name: 'RC PDF Server 2', chip: 'vehicle', placement: 'accordion', group: 'RC PDF', serverLabel: 'Server 2', badge: 'FAST', fields: [['Vehicle Number', 'text']], icon: '\uD83C\uDFCD\uFE0F' },
+  { name: 'RC PDF Server 3', chip: 'vehicle', placement: 'accordion', group: 'RC PDF', serverLabel: 'Server 3', badge: 'NEW', fields: [['Vehicle Number', 'text']], icon: '\uD83C\uDFCD\uFE0F' },
+  { name: 'RC PDF Server 4', chip: 'vehicle', placement: 'accordion', group: 'RC PDF', serverLabel: 'Server 4', badge: 'PRO', fields: [['Vehicle Number', 'text']], icon: '\uD83C\uDFCD\uFE0F' },
+  { name: 'RC PDF Server 5', chip: 'vehicle', placement: 'accordion', group: 'RC PDF', serverLabel: 'Server 5', badge: 'LIVE', fields: [['Vehicle Number', 'text']], icon: '\uD83C\uDFCD\uFE0F' },
+  { name: 'DL PDF HD', chip: 'vehicle', placement: 'accordion', group: 'DL PDF', serverLabel: 'HD', badge: 'PRO', fields: [['DL Number', 'text'], ['DOB', 'date']], icon: '\uD83E\uDEAA' },
+  { name: 'Aadhaar PDF Biometric', chip: 'aadhaar', placement: 'accordion', group: 'Aadhaar PDF', serverLabel: 'Biometric', badge: 'FAST', fields: [['Aadhaar Number', 'text']], icon: '\uD83C\uDD94' },
+  { name: 'Aadhaar PDF OTP', chip: 'aadhaar', placement: 'accordion', group: 'Aadhaar PDF', serverLabel: 'OTP', badge: 'LIVE', fields: [['Aadhaar Number', 'text'], ['Mobile Number', 'text']], icon: '\uD83C\uDD94' },
+  { name: 'Farmer DBT Status', chip: 'farmer', placement: 'accordion', group: 'Farmer DBT', serverLabel: 'Server 1', badge: 'NEW', fields: [['Registration / Aadhaar Number', 'text']], icon: '\uD83C\uDF3E' }
+];
+
+/* ============================== ROUTER ============================== */
+const routes = [];
+const route = (method, pattern, opt, fn) => {
+  const keys = [];
+  const re = new RegExp('^' + pattern.replace(/:(\w+)/g, (_, k) => { keys.push(k); return '([^/]+)'; }) + '$');
+  routes.push({ method, re, keys, opt, fn });
+};
+const send = (res, code, obj, extra) => {
+  res.writeHead(code, Object.assign({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }, extra || {}));
   res.end(JSON.stringify(obj));
 };
-
-http.createServer((req, res) => {
-  const url = req.url.split('?')[0];
-
-  if (url === '/api/rev' && req.method === 'GET') return send(res, 200, { rev });
-  if (url === '/api/state' && req.method === 'GET') return send(res, 200, { rev, data: state });
-
-  if (url === '/api/state' && req.method === 'PUT') {
+function readBody(req, limit) {
+  return new Promise((resolve, reject) => {
     let size = 0; const chunks = [];
-    req.on('data', c => {
-      size += c.length;
-      if (size > MAX_BODY) { send(res, 413, { error: 'too large' }); req.destroy(); return; }
-      chunks.push(c);
-    });
-    req.on('end', () => {
-      let body;
-      try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch (e) { return send(res, 400, { error: 'bad json' }); }
-      const d = body && body.data;
-      if (!d || !Array.isArray(d.users) || !d.users.length || !Array.isArray(d.services)) return send(res, 400, { error: 'invalid data' });
-      if (state !== null && body.baseRev !== rev) return send(res, 409, { rev, data: state });   // kisi aur device ne beech me save kiya
-      state = d; rev++;
-      try { persist(); } catch (e) { console.error('Save error', e); return send(res, 500, { error: 'disk write failed' }); }
-      send(res, 200, { rev });
-    });
-    return;
-  }
+    req.on('data', c => { size += c.length; if (size > limit) { reject(new HttpError(413, 'Request bahut badi hai')); req.destroy(); } else chunks.push(c); });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+const clientIp = req => (TRUST_PROXY && String(req.headers['x-forwarded-for'] || '').split(',')[0].trim()) || req.socket.remoteAddress || 'ip';
 
-  const f = PAGES[url];
-  if (f && req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': f[0], 'Cache-Control': 'no-cache' });
-    return res.end(f[1]);
+/* ---------------------------- PUBLIC ---------------------------- */
+route('GET', '/api/public', {}, c => c.json(200, { settings: publicSettings() }));
+route('GET', '/api/captcha', {}, c => c.json(200, newCaptcha()));
+
+route('POST', '/api/login', {}, c => {
+  const ip = clientIp(c.req), b = c.body;
+  if (tooMany('login:' + ip, 10, 10 * 60000)) bad('Bahut zyada galat koshish. 10 minute baad try karein.', 429);
+  const u = str(b.u, 80), p = String(b.p || '');
+  let user;
+  try {
+    if (b.mode === 'customer') {
+      checkCaptcha(b.capId, b.cap);
+      user = state.users.find(x => x.role === 'customer' && (x.u === u || (x.mobile && x.mobile === u)));
+    } else {
+      const target = b.role === 'operator' ? 'staff' : 'admin';
+      user = state.users.find(x => x.role === target && x.u === u);
+    }
+    if (!user || !safeEq(user.hash, hashPw(p))) bad('Galat username ya password', 401);
+    if (user.locked) bad('Account locked / banned hai. Admin se sampark karein.', 403);
+  } catch (e) { hit('login:' + ip); throw e; }
+  user.loginCount = (user.loginCount || 0) + 1; user.lastLogin = now();
+  commit();
+  const token = newSession(user.id);
+  const secure = TRUST_PROXY && c.req.headers['x-forwarded-proto'] === 'https' || process.env.COOKIE_SECURE === '1';
+  c.json(200, { me: publicUser(user) }, { 'Set-Cookie': 'pp_sid=' + token + '; HttpOnly; Path=/; SameSite=Lax; Max-Age=' + SESSION_TTL / 1000 + (secure ? '; Secure' : '') });
+});
+
+route('POST', '/api/register', {}, c => {
+  const ip = clientIp(c.req), b = c.body;
+  if (tooMany('reg:' + ip, 10, 3600000)) bad('Bahut zyada registrations. Baad me try karein.', 429);
+  hit('reg:' + ip);
+  checkCaptcha(b.capId, b.cap);
+  const name = str(b.name, 80), u = str(b.u, 40), p = String(b.p || ''), m = str(b.mobile, 20).replace(/[\s-]/g, '').replace(/^\+?91(?=\d{10}$)/, '');
+  if (!name || !u || !m || p.length < 8) bad('Sabhi field bharein (password min 8 akshar)');
+  if (/\s/.test(u) || u.length < 3) bad('Username 3+ akshar ka ho, bina space ke');
+  if (!/^[6-9]\d{9}$/.test(m)) bad('10 digit ka sahi mobile number dalein');
+  if (state.users.some(x => x.u.toLowerCase() === u.toLowerCase() || x.mobile === m)) bad('Mobile ya Username pehle se registered hai');
+  const user = { id: nextId('CUS', 4), u, name, mobile: m, role: 'customer', hash: hashPw(p), wallet: 0, loginCount: 1, lastLogin: now(), created: now() };
+  state.users.push(user);
+  commit();
+  const token = newSession(user.id);
+  c.json(200, { me: publicUser(user) }, { 'Set-Cookie': 'pp_sid=' + token + '; HttpOnly; Path=/; SameSite=Lax; Max-Age=' + SESSION_TTL / 1000 });
+});
+
+/* ---------------------------- SESSION ---------------------------- */
+route('POST', '/api/logout', {}, c => {
+  const t = parseCookies(c.req.headers.cookie).pp_sid;
+  if (t) { sessions.delete(sha256(t)); saveSessions(); }
+  c.json(200, { ok: true }, { 'Set-Cookie': 'pp_sid=; HttpOnly; Path=/; Max-Age=0' });
+});
+route('GET', '/api/bootstrap', { auth: true }, c => {
+  const u = c.user, admin = u.role === 'admin';
+  let services = state.services;
+  if (!admin) services = services.filter(s => s.on !== false);
+  if (u.role === 'staff') services = services.filter(s => (u.services || []).includes('ALL') || (u.services || []).includes(s.id));
+  const out = {
+    me: publicUser(u), rev, counts: counts(u), stats: stats(u),
+    services: services.slice().sort((a, b) => a.sort - b.sort).map(s => admin ? Object.assign(svcPublic(s), { endpoints: s.endpoints }) : svcPublic(s)),
+    chips: CHIPS, settings: publicSettings()
+  };
+  if (u.role === 'customer') out.pay = { upi: state.settings.upi, qr: state.settings.qr };
+  if (admin) out.staffServices = state.services.map(s => ({ id: s.id, name: s.name }));
+  c.json(200, out);
+});
+route('GET', '/api/poll', { auth: true }, c => c.json(200, { rev, counts: counts(c.user), wallet: r2(c.user.wallet) }));
+route('POST', '/api/me/password', { auth: true }, c => {
+  const o = String(c.body.old || ''), n = String(c.body.new || '');
+  if (n.length < 8) bad('Naya password kam se kam 8 akshar ka ho');
+  if (!safeEq(c.user.hash, hashPw(o))) bad('Purana password galat hai');
+  c.user.hash = hashPw(n); commit();
+  dropUserSessions(c.user.id, c.sessKey);
+  c.json(200, { ok: true });
+});
+
+/* ---------------------------- ORDERS ---------------------------- */
+route('GET', '/api/orders', { auth: true }, c => {
+  const q = c.query, st = q.get('status'), kw = (q.get('q') || '').toLowerCase().trim();
+  const limit = Math.min(Number(q.get('limit')) || 200, 1000), offset = Number(q.get('offset')) || 0;
+  let list = state.orders.filter(o => canSeeOrder(c.user, o));
+  if (st && ['Pending', 'Completed', 'Rejected'].includes(st)) list = list.filter(o => o.status === st);
+  if (kw) list = list.filter(o => [o.id, o.sname, o.uname, o.uid].some(x => String(x || '').toLowerCase().includes(kw)));
+  c.json(200, { total: list.length, items: list.slice(offset, offset + limit).map(o => orderView(o, isDesk(c.user))) });
+});
+
+route('POST', '/api/orders', { auth: true, roles: ['customer'], limit: LIMIT_UPLOAD }, c => {
+  const s = state.services.find(x => x.id === c.body.sid);
+  if (!s || s.on === false) bad('Service uplabdh nahi hai');
+  const user = c.user;
+  if (user.wallet < s.price) bad('Wallet balance kam hai. Pehle Add Money karein.');
+  const input = c.body.formData && typeof c.body.formData === 'object' ? c.body.formData : {};
+  const formData = {}, saved = [];
+  try {
+    for (const f of s.fields) {
+      const v = input[f.label];
+      if (f.type === 'file') {
+        if (v && v.data) { const ref = saveDataUrl(v.data, v.name); saved.push(ref.file); formData[f.label] = ref; }
+        else if (f.req) bad(f.label + ' bharna anivarya hai');
+        continue;
+      }
+      const val = str(v, f.type === 'textarea' ? 1500 : 300);
+      if (f.req && !val) bad(f.label + ' bharna anivarya hai');
+      if (f.type === 'dropdown' && val) {
+        const opts = String(f.opts || '').split(',').map(x => x.trim()).filter(Boolean);
+        if (opts.length && !opts.includes(val)) bad(f.label + ' ka option galat hai');
+      }
+      if (val || f.req) formData[f.label] = val;
+    }
+  } catch (e) { saved.forEach(n => { try { fs.unlinkSync(path.join(UPLOAD_DIR, n)); } catch (x) { /* ignore */ } }); throw e; }
+  const id = nextId('ORD', 6);
+  walletMove(user, -s.price, 'order', s.name + (s.serverLabel ? ' (' + s.serverLabel + ')' : ''), user.u, id);
+  const order = { id, sid: s.id, sname: s.name, uid: user.id, uname: user.u, price: s.price, formData, status: 'Pending', t: now() };
+  if (s.serverLabel) order.serverLabel = s.serverLabel;
+  state.orders.unshift(order);
+  commit();
+  notify('order', '\uD83D\uDED2 New Order Placed', [['Service', s.name + (s.serverLabel ? ' - ' + s.serverLabel : '')], ['Customer', user.name + ' (' + user.u + ')'], ['Amount', rupee(s.price)], ['Reference ID', '#' + id]]);
+  setImmediate(() => dispatchOrder(order, s).catch(() => { /* never surfaces to customer */ }));
+  c.json(200, { id, wallet: user.wallet });
+});
+
+function deskOrder(c) {
+  const o = state.orders.find(x => x.id === c.params.id);
+  if (!o || !isDesk(c.user) || !canSeeOrder(c.user, o)) bad('Order nahi mila', 404);
+  return o;
+}
+route('POST', '/api/orders/:id/complete', { auth: true, roles: ['admin', 'staff'], limit: LIMIT_UPLOAD }, c => {
+  const o = deskOrder(c);
+  if (o.status !== 'Pending') bad('Sirf Pending order complete ho sakta hai');
+  const f = c.body.file;
+  if (!f || !f.data) bad('Result file chunein');
+  const ref = saveDataUrl(f.data, f.name);
+  o.fileRef = ref; o.fname = ref.name; o.status = 'Completed'; o.doneBy = c.user.u; o.doneAt = now();
+  commit();
+  c.json(200, { ok: true });
+});
+route('POST', '/api/orders/:id/reject', { auth: true, roles: ['admin', 'staff'] }, c => {
+  const o = deskOrder(c);
+  if (o.status !== 'Pending') bad('Sirf Pending order reject ho sakta hai');
+  const cust = findUser(o.uid);
+  if (cust) walletMove(cust, o.price, 'refund', 'Order #' + o.id + ' rejected', c.user.u, o.id);
+  o.status = 'Rejected'; o.note = str(c.body.reason, 200); o.doneBy = c.user.u; o.doneAt = now();
+  commit();
+  c.json(200, { ok: true, refunded: o.price });
+});
+route('GET', '/api/orders/:id/file', { auth: true }, c => {
+  const o = state.orders.find(x => x.id === c.params.id);
+  if (!o || !canSeeOrder(c.user, o)) bad('Order nahi mila', 404);
+  if (o.fileRef) return sendFileRef(c.res, o.fileRef);
+  if (o.file) return sendLegacyDataUrl(c.res, o.file, o.fname);
+  bad('Abhi file upload nahi hui', 404);
+});
+route('GET', '/api/orders/:id/attachment', { auth: true }, c => {
+  const o = state.orders.find(x => x.id === c.params.id);
+  if (!o || !canSeeOrder(c.user, o)) bad('Order nahi mila', 404);
+  const v = (o.formData || {})[c.query.get('k')];
+  if (v && typeof v === 'object' && v.file) return sendFileRef(c.res, v);
+  if (typeof v === 'string' && v.startsWith('data:')) return sendLegacyDataUrl(c.res, v, c.query.get('k'));
+  bad('Attachment nahi mila', 404);
+});
+
+/* ---------------------------- WALLET / PAYMENTS ---------------------------- */
+route('GET', '/api/wallet', { auth: true, roles: ['customer'] }, c => c.json(200, {
+  balance: r2(c.user.wallet), pays: state.pays.filter(p => p.uid === c.user.id).slice(0, 100),
+  ledger: state.ledger.filter(l => l.uid === c.user.id).slice(0, 100), pay: { upi: state.settings.upi, qr: state.settings.qr }
+}));
+route('POST', '/api/pays', { auth: true, roles: ['customer'] }, c => {
+  const amt = r2(c.body.amt), utr = str(c.body.utr, 40).toUpperCase();
+  if (!(amt > 0) || amt > 100000) bad('Sahi amount dalein (max \u20B91,00,000)');
+  if (!/^[A-Z0-9]{6,30}$/.test(utr)) bad('Sahi UTR / Transaction ID dalein (12 digit)');
+  if (state.pays.some(p => p.utr === utr && p.status !== 'Rejected')) bad('Ye UTR pehle se submit ho chuka hai');
+  if (state.pays.filter(p => p.uid === c.user.id && p.status === 'Pending').length >= 5) bad('Aapke 5 payments verify hone baaki hain. Thoda wait karein.');
+  const pay = { id: nextId('PAY', 4), uid: c.user.id, uname: c.user.u, amt, utr, status: 'Pending', t: now() };
+  state.pays.unshift(pay);
+  commit();
+  notify('deposit', '\uD83D\uDCB0 New UTR / Add Money Submitted', [['Customer', c.user.name + ' (' + c.user.u + ')'], ['Amount', rupee(amt)], ['UTR', utr], ['Reference ID', pay.id]]);
+  c.json(200, { id: pay.id });
+});
+
+/* ---------------------------- COMPLAINTS ---------------------------- */
+route('GET', '/api/complaints', { auth: true, roles: ['customer', 'admin'] }, c =>
+  c.json(200, { items: state.complaints.filter(t => c.user.role === 'admin' || t.uid === c.user.id) }));
+route('POST', '/api/complaints', { auth: true, roles: ['customer'] }, c => {
+  const subject = str(c.body.subject, 120), msg = str(c.body.msg, 2000), oid = str(c.body.oid, 20);
+  if (!subject || !msg) bad('Subject aur problem dono likhein');
+  if (oid && !state.orders.some(o => o.id === oid && o.uid === c.user.id)) bad('Order ID sahi nahi hai');
+  if (state.complaints.filter(t => t.uid === c.user.id && t.status === 'Open').length >= 10) bad('Pehle purane tickets resolve hone dein');
+  const t = { id: nextId('TKT', 4), uid: c.user.id, uname: c.user.u, oid, subject, msg, status: 'Open', t: now(), replies: [] };
+  state.complaints.unshift(t);
+  commit();
+  notify('complaint', '\uD83C\uDFA7 New Complaint / Support Ticket', [['Ticket', t.id], ['Customer', c.user.name + ' (' + c.user.u + ')'], ['Order', oid ? '#' + oid : '-'], ['Subject', subject], ['Message', msg.slice(0, 300)]]);
+  c.json(200, { id: t.id });
+});
+route('POST', '/api/complaints/:id/reply', { auth: true, roles: ['admin'] }, c => {
+  const t = state.complaints.find(x => x.id === c.params.id), txt = str(c.body.text, 2000);
+  if (!t || !txt) bad('Reply likhein');
+  t.replies.push({ by: 'Support', text: txt, t: now() });
+  t.status = c.body.status === 'Open' ? 'Open' : 'Resolved';
+  commit();
+  c.json(200, { ok: true });
+});
+
+/* ---------------------------- ADMIN: USERS & WALLETS ---------------------------- */
+const A = { auth: true, roles: ['admin'] };
+route('GET', '/api/admin/users', A, c => c.json(200, { items: state.users.map(publicUser) }));
+route('POST', '/api/admin/users/:id/wallet', A, c => {
+  const u = findUser(c.params.id);
+  if (!u || u.role !== 'customer') bad('Customer nahi mila', 404);
+  const amt = r2(c.body.amt), type = c.body.type === 'debit' ? 'debit' : 'credit';
+  if (!(amt > 0) || amt > 1000000) bad('Sahi amount dalein');
+  if (type === 'debit' && u.wallet < amt) bad('Customer ke wallet me itna balance nahi hai');
+  walletMove(u, type === 'debit' ? -amt : amt, type === 'debit' ? 'admin-debit' : 'admin-credit', str(c.body.note, 150) || 'Manual adjustment', c.user.u);
+  commit();
+  c.json(200, { wallet: u.wallet });
+});
+route('POST', '/api/admin/users/:id/password', A, c => {
+  const u = findUser(c.params.id), p = String(c.body.password || '');
+  if (!u) bad('User nahi mila', 404);
+  if (p.length < 8) bad('Password min 8 akshar ka ho');
+  u.hash = hashPw(p); commit(); dropUserSessions(u.id);
+  c.json(200, { ok: true });
+});
+route('POST', '/api/admin/users/:id/lock', A, c => {
+  const u = findUser(c.params.id);
+  if (!u) bad('User nahi mila', 404);
+  if (u.role === 'admin') bad('Admin ko lock nahi kar sakte');
+  u.locked = !!c.body.locked; commit();
+  if (u.locked) dropUserSessions(u.id);
+  c.json(200, { locked: u.locked });
+});
+route('POST', '/api/admin/staff', A, c => {
+  const name = str(c.body.name, 80), u = str(c.body.u, 40), p = String(c.body.p || '');
+  if (!name || u.length < 3 || /\s/.test(u) || p.length < 8) bad('Sabhi field bharein (username 3+, password min 8)');
+  if (state.users.some(x => x.u.toLowerCase() === u.toLowerCase())) bad('Username pehle se hai');
+  const valid = new Set(state.services.map(s => s.id));
+  const svc = (Array.isArray(c.body.services) ? c.body.services : []).filter(x => x === 'ALL' || valid.has(x));
+  const user = { id: nextId('STF', 4), u, name, role: 'staff', services: svc, hash: hashPw(p), wallet: 0, loginCount: 0, created: now() };
+  state.users.push(user); commit();
+  c.json(200, { id: user.id });
+});
+route('PUT', '/api/admin/staff/:id', A, c => {
+  const u = findUser(c.params.id);
+  if (!u || u.role !== 'staff') bad('Staff nahi mila', 404);
+  const valid = new Set(state.services.map(s => s.id));
+  u.services = (Array.isArray(c.body.services) ? c.body.services : []).filter(x => x === 'ALL' || valid.has(x));
+  commit(); c.json(200, { ok: true });
+});
+route('DELETE', '/api/admin/staff/:id', A, c => {
+  const i = state.users.findIndex(x => x.id === c.params.id && x.role === 'staff');
+  if (i < 0) bad('Staff nahi mila', 404);
+  dropUserSessions(state.users[i].id); state.users.splice(i, 1); commit();
+  c.json(200, { ok: true });
+});
+route('GET', '/api/admin/ledger', A, c => {
+  const uid = c.query.get('uid');
+  c.json(200, { items: state.ledger.filter(l => !uid || l.uid === uid).slice(0, 500) });
+});
+
+/* ---------------------------- ADMIN: UTR QUEUE ---------------------------- */
+route('GET', '/api/admin/pays', A, c => c.json(200, { items: state.pays.slice(0, 500) }));
+route('POST', '/api/admin/pays/:id/verify', A, c => {
+  const p = state.pays.find(x => x.id === c.params.id);
+  if (!p) bad('Payment nahi mili', 404);
+  if (p.status !== 'Pending') bad('Ye payment pehle hi process ho chuki hai');
+  if (c.body.ok) {
+    const u = findUser(p.uid);
+    if (!u) bad('Customer nahi mila');
+    walletMove(u, p.amt, 'deposit', 'UTR ' + p.utr + ' approved (' + p.id + ')', c.user.u, p.id);
+    p.status = 'Completed';
+  } else p.status = 'Rejected';
+  p.doneBy = c.user.u; p.doneAt = now();
+  commit();
+  c.json(200, { status: p.status });
+});
+
+/* ---------------------------- ADMIN: SERVICES / LAYOUT ---------------------------- */
+route('POST', '/api/admin/services', A, c => {
+  const s = cleanService(c.body, null);
+  s.id = nextId('SRV', 4);
+  state.services.push(s); commit();
+  c.json(200, { id: s.id });
+});
+route('PUT', '/api/admin/services/:id', A, c => {
+  const i = state.services.findIndex(x => x.id === c.params.id);
+  if (i < 0) bad('Service nahi mili', 404);
+  state.services[i] = cleanService(c.body, state.services[i]); commit();
+  c.json(200, { ok: true });
+});
+route('POST', '/api/admin/services/:id/toggle', A, c => {
+  const s = state.services.find(x => x.id === c.params.id);
+  if (!s) bad('Service nahi mili', 404);
+  s.on = s.on === false; commit();
+  c.json(200, { on: s.on });
+});
+route('POST', '/api/admin/services/:id/duplicate', A, c => {
+  const s = state.services.find(x => x.id === c.params.id);
+  if (!s) bad('Service nahi mili', 404);
+  const copy = clone(s); copy.id = nextId('SRV', 4); copy.on = false; copy.sort = (s.sort || 0) + 1;
+  const m = /^(.*?)(\d+)$/.exec(s.serverLabel || '');
+  copy.serverLabel = m ? m[1] + (Number(m[2]) + 1) : (s.serverLabel ? s.serverLabel + ' 2' : '');
+  copy.name = s.name.replace(/\d+$/, '').trim() + (copy.serverLabel ? ' ' + copy.serverLabel : ' (Copy)');
+  state.services.push(copy); commit();
+  c.json(200, { id: copy.id });
+});
+route('DELETE', '/api/admin/services/:id', A, c => {
+  const i = state.services.findIndex(x => x.id === c.params.id);
+  if (i < 0) bad('Service nahi mili', 404);
+  const id = state.services[i].id;
+  state.services.splice(i, 1);
+  state.users.forEach(u => { if (u.role === 'staff' && Array.isArray(u.services)) u.services = u.services.filter(x => x !== id); });
+  commit();
+  c.json(200, { ok: true });
+});
+route('POST', '/api/admin/services/seed', A, c => {
+  let added = 0;
+  STARTER.forEach(t => {
+    if (state.services.some(s => s.name.toLowerCase() === t.name.toLowerCase())) return;
+    const s = cleanService({
+      name: t.name, price: 0, icon: t.icon, chip: t.chip, placement: t.placement, group: t.group, serverLabel: t.serverLabel || '',
+      badge: t.badge || '', sort: 100 + added, on: false, fields: t.fields.map(([label, type]) => ({ label, type, req: true })), instructions: []
+    }, null);
+    s.id = nextId('SRV', 4); state.services.push(s); added++;
+  });
+  if (added) commit();
+  c.json(200, { added });
+});
+
+/* ---------------------------- ADMIN: SETTINGS / NOTIFICATIONS ---------------------------- */
+route('GET', '/api/admin/settings', A, c => c.json(200, { settings: adminSettings(), log: notifyLog }));
+route('PUT', '/api/admin/settings', A, c => {
+  applySettings(String(c.body.section), c.body.values && typeof c.body.values === 'object' ? c.body.values : {});
+  commit();
+  c.json(200, { settings: adminSettings() });
+});
+route('POST', '/api/admin/notify/test', A, async c => {
+  const msg = { event: 'test', title: '\u2705 Test Notification', lines: [['Portal', state.settings.title], ['Sent by', c.user.u], ['Time', now()]] };
+  const out = {};
+  for (const [name, fn] of [['telegram', sendTelegram], ['whatsapp', sendWhatsApp]]) {
+    try { const r = await fn(msg); out[name] = r.skipped ? 'Not configured' : 'Sent OK'; logNotify(name, !r.skipped, 'test'); }
+    catch (e) { out[name] = 'FAILED: ' + e.message; logNotify(name, false, e.message); }
   }
-  res.writeHead(404); res.end('Not found');
-}).listen(PORT, () => console.log('Portal chalu: http://localhost:' + PORT));
+  c.json(200, out);
+});
+
+/* ---------------------------- ADMIN: REPORTS / BACKUP / RESTORE ---------------------------- */
+route('GET', '/api/admin/csv', A, c => {
+  const kind = c.query.get('kind');
+  const rows = {
+    orders: [['ID', 'Service', 'User', 'Price', 'Status', 'Time'], ...state.orders.map(o => [o.id, o.sname, o.uname, o.price, o.status, o.t])],
+    customers: [['ID', 'Name', 'Username', 'Mobile', 'Wallet', 'Logins', 'Locked'], ...state.users.filter(u => u.role === 'customer').map(u => [u.id, u.name, u.u, u.mobile, u.wallet, u.loginCount, !!u.locked])],
+    payments: [['ID', 'User', 'Amount', 'UTR', 'Status', 'Time'], ...state.pays.map(p => [p.id, p.uname, p.amt, p.utr, p.status, p.t])],
+    ledger: [['ID', 'User', 'Type', 'Amount', 'Balance', 'Note', 'By', 'Time'], ...state.ledger.map(l => [l.id, l.uname, l.type, l.amt, l.bal, l.note, l.by, l.t])]
+  }[kind];
+  if (!rows) bad('Unknown report');
+  const cell = v => { let s = String(v == null ? '' : v); if (/^[=+\-@]/.test(s)) s = "'" + s; return '"' + s.replace(/"/g, '""') + '"'; };
+  c.res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="' + kind + '.csv"', 'Cache-Control': 'no-store' });
+  c.res.end('\uFEFF' + rows.map(r => r.map(cell).join(',')).join('\r\n'));
+});
+route('GET', '/api/admin/backup', A, c => {
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  c.res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Disposition': 'attachment; filename="data-backup-' + stamp + '.json"', 'Cache-Control': 'no-store' });
+  c.res.end(JSON.stringify({ rev, data: state }));
+});
+function validateDb(x) {
+  if (!x || typeof x !== 'object') throw new Error('File ek JSON object nahi hai');
+  const d = x.data && typeof x.data === 'object' && !Array.isArray(x.data) ? x.data : x;
+  if (!Array.isArray(d.users) || !d.users.length) throw new Error('"users" list missing hai');
+  if (!Array.isArray(d.services)) throw new Error('"services" list missing hai');
+  ['orders', 'pays', 'complaints', 'ledger'].forEach(k => { if (d[k] !== undefined && !Array.isArray(d[k])) throw new Error('"' + k + '" list honi chahiye'); });
+  const ids = new Set();
+  d.users.forEach((u, i) => {
+    if (!u || typeof u.id !== 'string' || typeof u.u !== 'string' || !['admin', 'staff', 'customer'].includes(u.role)) throw new Error('User #' + (i + 1) + ' invalid hai');
+    if (!/^[a-f0-9]{64}$/.test(String(u.hash || ''))) throw new Error('User ' + u.u + ' ka password hash invalid hai');
+    if (ids.has(u.id)) throw new Error('Duplicate user id: ' + u.id);
+    ids.add(u.id);
+  });
+  if (!d.users.some(u => u.role === 'admin')) throw new Error('Backup me koi admin user nahi hai');
+  d.services.forEach((s, i) => { if (!s || typeof s.id !== 'string' || typeof s.name !== 'string') throw new Error('Service #' + (i + 1) + ' invalid hai'); });
+  return d;
+}
+route('POST', '/api/admin/restore', { auth: true, roles: ['admin'], limit: LIMIT_RESTORE }, c => {
+  let parsed = c.body.content;
+  try { if (typeof parsed === 'string') parsed = JSON.parse(parsed); } catch (e) { bad('JSON format galat hai: ' + e.message); }
+  let d;
+  try { d = validateDb(parsed); } catch (e) { bad('Restore rok diya gaya: ' + e.message); }
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(path.join(DATA_DIR, 'data.pre-restore-' + Date.now() + '.json'), JSON.stringify({ rev, data: state })); }
+  catch (e) { bad('Safety copy nahi ban saki, restore cancel: ' + e.message, 500); }
+  state = normalize(clone(d));
+  commit();
+  c.json(200, { ok: true, users: state.users.length, orders: state.orders.length, services: state.services.length });
+});
+
+/* ============================== STATIC FILES ============================== */
+const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'application/javascript; charset=utf-8', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.webp': 'image/webp', '.json': 'application/json' };
+function serveStatic(req, res, urlPath) {
+  let rel = decodeURIComponent(urlPath);
+  if (rel === '/') rel = '/index.html';
+  const file = path.normalize(path.join(PUBLIC_DIR, rel));
+  if (!file.startsWith(PUBLIC_DIR + path.sep)) { res.writeHead(403); return res.end('Forbidden'); }
+  fs.readFile(file, (err, buf) => {
+    if (err) { res.writeHead(404, { 'Content-Type': 'text/plain' }); return res.end('Not found'); }
+    res.writeHead(200, { 'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
+    res.end(buf);
+  });
+}
+
+/* ============================== SERVER ============================== */
+const server = http.createServer(async (req, res) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  let url;
+  try { url = new URL(req.url, 'http://x'); } catch (e) { res.writeHead(400); return res.end('Bad request'); }
+  const pathname = url.pathname;
+  try {
+    if (!pathname.startsWith('/api/')) {
+      if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); return res.end(); }
+      return serveStatic(req, res, pathname);
+    }
+    const r = routes.find(x => x.method === req.method && x.re.test(pathname));
+    if (!r) return send(res, 404, { error: 'API route nahi mila' });
+    const m = r.re.exec(pathname), params = {};
+    r.keys.forEach((k, i) => { params[k] = decodeURIComponent(m[i + 1]); });
+    const ctx = { req, res, params, query: url.searchParams, body: {}, user: null, json: (code, obj, extra) => send(res, code, obj, extra) };
+    if (r.opt.auth) {
+      const tok = parseCookies(req.headers.cookie).pp_sid;
+      const key = tok ? sha256(tok) : '', s = key && sessions.get(key);
+      const user = s && s.exp > Date.now() ? findUser(s.uid) : null;
+      if (!user || user.locked) { if (s) { sessions.delete(key); saveSessions(); } return send(res, 401, { error: 'Session khatam. Dobara login karein.' }); }
+      if (r.opt.roles && !r.opt.roles.includes(user.role)) return send(res, 403, { error: 'Aapko is kaam ki permission nahi hai' });
+      s.exp = Date.now() + SESSION_TTL;
+      ctx.user = user; ctx.sessKey = key;
+    }
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      if (req.headers['x-requested-with'] !== 'pp') return send(res, 403, { error: 'Blocked (CSRF check)' });
+      const raw = await readBody(req, r.opt.limit || LIMIT_JSON);
+      if (raw.length) { try { ctx.body = JSON.parse(raw.toString('utf8')); } catch (e) { return send(res, 400, { error: 'JSON format galat hai' }); } }
+      if (!ctx.body || typeof ctx.body !== 'object') ctx.body = {};
+    }
+    await r.fn(ctx);
+  } catch (e) {
+    if (res.headersSent) { try { res.end(); } catch (x) { /* ignore */ } return; }
+    if (e instanceof HttpError) return send(res, e.code, { error: e.message });
+    console.error('Unhandled error on', req.method, pathname, e);
+    send(res, 500, { error: 'Server error. Dobara try karein.' });
+  }
+});
+server.listen(PORT, () => console.log('Portal running: http://localhost:' + PORT + '   (data: ' + FILE + ')'));
+
+function shutdown() { try { persist(); fs.writeFileSync(SESSION_FILE, JSON.stringify(Object.fromEntries(sessions))); } catch (e) { /* ignore */ } process.exit(0); }
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+process.on('unhandledRejection', e => console.error('Unhandled rejection:', e));
